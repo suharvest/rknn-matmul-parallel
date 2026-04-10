@@ -231,15 +231,9 @@ See `examples/export_qwen3_asr.py` for reference.
 
 ## Why Not Just Use RKLLM?
 
-| Aspect | This Library | RKLLM |
-|--------|--------------|-------|
-| **Performance** | ~16 ms/token | ~16 ms/token |
-| **Open source** | ✅ Full code | ❌ Closed `librkllmrt.so` |
-| **RKNN compatibility** | ✅ No conflict | ⚠️ Conflicts with RKNN models |
-| **Custom ops** | ✅ Full control | ❌ Black box |
-| **Debuggability** | ✅ Transparent | ❌ Opaque |
+See the [comparison table above](#why-this-exists) for a detailed breakdown.
 
-RKLLM has known conflicts when running alongside RKNN models (e.g., TTS vocoder, ASR encoder). This library provides a conflict-free alternative with equivalent performance.
+**TL;DR:** This library matches RKLLM's ~16ms/token performance while being fully open-source and conflict-free with RKNN models.
 
 ## Contributing
 
