@@ -18,8 +18,13 @@
 
 /**
  * Persistent matmul context for a single projection.
- * For single-core mode, uses simple rknn_matmul context.
- * For dual-core mode, may use batch_matmul for parallel execution.
+ *
+ * In pooled mode (is_pooled=1): ctx, mem_A, mem_C are shared across all
+ * layers via a context pool. Only mem_B (weight) is per-projection.
+ * Before each run, B is rebound via rknn_matmul_set_io_mem.
+ *
+ * This reduces NPU handle count from O(layers×7) to O(unique_dims + layers×7_B_only),
+ * avoiding the /dev/rknpu per-process handle table limit (~1020).
  */
 typedef struct {
     rknn_matmul_ctx ctx;
@@ -29,7 +34,23 @@ typedef struct {
     rknn_tensor_mem* mem_C;
     int K, N;
     int initialized;
+    int is_pooled;          /* 1 = ctx/A/C are shared, only destroy B */
 } PersistentMatmul;
+
+/**
+ * Context pool entry — one per unique (K, N) dimension pair.
+ * Shared by all layers that have the same projection dimensions.
+ */
+typedef struct {
+    rknn_matmul_ctx ctx;
+    rknn_matmul_io_attr io;
+    rknn_tensor_mem* mem_A;
+    rknn_tensor_mem* mem_C;
+    int K, N;
+    int initialized;
+} MatmulPoolEntry;
+
+#define MAX_MATMUL_POOL 8
 
 /**
  * Layer matmul contexts (all projections for one layer).
@@ -70,6 +91,10 @@ struct MatmulDecoderContext {
     /* Layer contexts */
     LayerMatmulContext* layers;
 
+    /* Context pool (reduces NPU handle count for large models) */
+    MatmulPoolEntry pool[MAX_MATMUL_POOL];
+    int n_pool;
+
     /* KV Cache */
     MatmulKVCache* kv_cache;
 
@@ -98,6 +123,105 @@ struct MatmulDecoderContext {
 
 /* ─── Matmul Context Management ─── */
 
+/* Map quantization type to RKNN matmul type */
+static rknn_matmul_type quant_to_rknn_type(QuantizationType quant_type) {
+    switch (quant_type) {
+        case QUANT_FP16:     return RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT16;
+        case QUANT_INT4:
+        case QUANT_INT4_G128: return RKNN_FLOAT16_MM_INT4_TO_FLOAT16;
+        case QUANT_INT8:     return RKNN_FLOAT16_MM_INT8_TO_FLOAT16;
+        default:             return RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT16;
+    }
+}
+
+/* ─── Context Pool ─── */
+
+/**
+ * Find or create a pool entry for the given (K, N) dimensions.
+ * Returns pool index, or -1 on error.
+ */
+static int pool_get_or_create(MatmulPoolEntry* pool, int* n_pool,
+                               int K, int N, QuantizationType quant_type) {
+    /* Search existing */
+    for (int i = 0; i < *n_pool; i++) {
+        if (pool[i].K == K && pool[i].N == N) return i;
+    }
+
+    /* Create new */
+    if (*n_pool >= MAX_MATMUL_POOL) {
+        fprintf(stderr, "[Pool] Exceeded max pool size %d\n", MAX_MATMUL_POOL);
+        return -1;
+    }
+
+    int idx = (*n_pool)++;
+    MatmulPoolEntry* pe = &pool[idx];
+    memset(pe, 0, sizeof(*pe));
+
+    rknn_matmul_info info;
+    memset(&info, 0, sizeof(info));
+    info.M = 1;
+    info.K = K;
+    info.N = N;
+    info.type = quant_to_rknn_type(quant_type);
+    info.B_layout = 1;
+
+    int ret = rknn_matmul_create(&pe->ctx, &info, &pe->io);
+    if (ret != 0) {
+        fprintf(stderr, "[Pool] rknn_matmul_create(%d,%d) failed: %d\n", K, N, ret);
+        (*n_pool)--;
+        return -1;
+    }
+
+    pe->mem_A = rknn_create_mem(pe->ctx, pe->io.A.size);
+    pe->mem_C = rknn_create_mem(pe->ctx, pe->io.C.size);
+    if (!pe->mem_A || !pe->mem_C) {
+        fprintf(stderr, "[Pool] rknn_create_mem failed for pool(%d,%d)\n", K, N);
+        rknn_matmul_destroy(pe->ctx);
+        (*n_pool)--;
+        return -1;
+    }
+
+    rknn_matmul_set_io_mem(pe->ctx, pe->mem_A, &pe->io.A);
+    rknn_matmul_set_io_mem(pe->ctx, pe->mem_C, &pe->io.C);
+
+    pe->K = K;
+    pe->N = N;
+    pe->initialized = 1;
+
+    printf("[Pool] Created pool[%d]: K=%d N=%d (handles: 1 ctx + A + C = 3)\n", idx, K, N);
+    return idx;
+}
+
+/**
+ * Allocate a B weight buffer from a pool entry.
+ * Sets up PersistentMatmul to share ctx/A/C from pool, own B only.
+ */
+static int create_pooled_matmul(PersistentMatmul* pm, MatmulPoolEntry* pe) {
+    memset(pm, 0, sizeof(PersistentMatmul));
+
+    pm->ctx = pe->ctx;
+    pm->io  = pe->io;
+    pm->mem_A = pe->mem_A;
+    pm->mem_C = pe->mem_C;
+
+    /* Only B is per-projection */
+    pm->mem_B = rknn_create_mem(pe->ctx, pe->io.B.size);
+    if (!pm->mem_B) {
+        fprintf(stderr, "[Pool] rknn_create_mem for B failed\n");
+        return MATMUL_DECODER_ERR_MEMORY;
+    }
+
+    pm->K = pe->K;
+    pm->N = pe->N;
+    pm->initialized = 1;
+    pm->is_pooled = 1;
+
+    return MATMUL_DECODER_OK;
+}
+
+/**
+ * Legacy: create standalone matmul context (for small models / non-pooled mode).
+ */
 static int create_persistent_matmul(PersistentMatmul* pm, int M, int K, int N,
                                      QuantizationType quant_type) {
     memset(pm, 0, sizeof(PersistentMatmul));
@@ -107,24 +231,8 @@ static int create_persistent_matmul(PersistentMatmul* pm, int M, int K, int N,
     info.M = M;
     info.K = K;
     info.N = N;
-
-    /* Map quantization type to RKNN type */
-    switch (quant_type) {
-        case QUANT_FP16:
-            info.type = RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT16;
-            break;
-        case QUANT_INT4:
-        case QUANT_INT4_G128:
-            info.type = RKNN_FLOAT16_MM_INT4_TO_FLOAT16;
-            break;
-        case QUANT_INT8:
-            info.type = RKNN_FLOAT16_MM_INT8_TO_FLOAT16;
-            break;
-        default:
-            return MATMUL_DECODER_ERR_UNSUPPORTED;
-    }
-
-    info.B_layout = 1;  /* Native layout for better performance */
+    info.type = quant_to_rknn_type(quant_type);
+    info.B_layout = 1;
 
     int ret = rknn_matmul_create(&pm->ctx, &info, &pm->io);
     if (ret != 0) {
@@ -148,6 +256,7 @@ static int create_persistent_matmul(PersistentMatmul* pm, int M, int K, int N,
     pm->K = K;
     pm->N = N;
     pm->initialized = 1;
+    pm->is_pooled = 0;
 
     return MATMUL_DECODER_OK;
 }
@@ -155,17 +264,40 @@ static int create_persistent_matmul(PersistentMatmul* pm, int M, int K, int N,
 static void destroy_persistent_matmul(PersistentMatmul* pm) {
     if (!pm->initialized) return;
 
-    if (pm->mem_A) rknn_destroy_mem(pm->ctx, pm->mem_A);
-    if (pm->mem_B) rknn_destroy_mem(pm->ctx, pm->mem_B);
-    if (pm->mem_C) rknn_destroy_mem(pm->ctx, pm->mem_C);
-    if (pm->ctx) rknn_matmul_destroy(pm->ctx);
+    if (pm->is_pooled) {
+        /* Pooled: only destroy B (ctx/A/C are shared via pool) */
+        if (pm->mem_B) rknn_destroy_mem(pm->ctx, pm->mem_B);
+    } else {
+        /* Standalone: destroy everything */
+        if (pm->mem_A) rknn_destroy_mem(pm->ctx, pm->mem_A);
+        if (pm->mem_B) rknn_destroy_mem(pm->ctx, pm->mem_B);
+        if (pm->mem_C) rknn_destroy_mem(pm->ctx, pm->mem_C);
+        if (pm->ctx) rknn_matmul_destroy(pm->ctx);
+    }
 
     memset(pm, 0, sizeof(PersistentMatmul));
 }
 
+static void destroy_pool(MatmulPoolEntry* pool, int n_pool) {
+    for (int i = 0; i < n_pool; i++) {
+        MatmulPoolEntry* pe = &pool[i];
+        if (!pe->initialized) continue;
+        if (pe->mem_A) rknn_destroy_mem(pe->ctx, pe->mem_A);
+        if (pe->mem_C) rknn_destroy_mem(pe->ctx, pe->mem_C);
+        if (pe->ctx) rknn_matmul_destroy(pe->ctx);
+        memset(pe, 0, sizeof(*pe));
+    }
+}
+
 static int run_persistent_matmul(PersistentMatmul* pm, const float* input_fp32, float* output_fp32) {
-    /* Convert input to FP16 */
     int K = pm->K, N = pm->N;
+
+    /* Pooled mode: rebind B weight before each run (~10μs ioctl) */
+    if (pm->is_pooled) {
+        rknn_matmul_set_io_mem(pm->ctx, pm->mem_B, &pm->io.B);
+    }
+
+    /* Convert input to FP16 */
     vec_fp32_to_fp16((int16_t*)pm->mem_A->virt_addr, input_fp32, K);
 
     /* Run matmul */
@@ -537,45 +669,58 @@ MatmulDecoderContext* matmul_decoder_create(const char* model_dir,
         return NULL;
     }
 
-    /* Create persistent matmul contexts for each layer */
-    printf("[MatmulDecoder] Creating %d layer matmul contexts...\n", num_layers);
+    /* Build context pool — one entry per unique (K, N) dimension pair.
+     * For Qwen3-0.6B: 5 unique pairs instead of 196 standalone contexts.
+     * Saves ~573 NPU handles (from 784 down to ~211). */
+    ctx->n_pool = 0;
+    struct { const char* name; int K; int N; } proj_defs[] = {
+        {"q_proj",    hidden_dim,              num_q_heads * head_dim},
+        {"k_proj",    hidden_dim,              num_kv_heads * head_dim},
+        {"v_proj",    hidden_dim,              num_kv_heads * head_dim},
+        {"o_proj",    num_q_heads * head_dim,  hidden_dim},
+        {"gate_proj", hidden_dim,              ffn_dim},
+        {"up_proj",   hidden_dim,              ffn_dim},
+        {"down_proj", ffn_dim,                 hidden_dim},
+    };
+    int proj_pool_idx[7];
+    for (int p = 0; p < 7; p++) {
+        proj_pool_idx[p] = pool_get_or_create(ctx->pool, &ctx->n_pool,
+                                               proj_defs[p].K, proj_defs[p].N, quant_type);
+        if (proj_pool_idx[p] < 0) {
+            fprintf(stderr, "[MatmulDecoder] Failed to create pool for %s\n", proj_defs[p].name);
+            matmul_decoder_destroy(ctx);
+            return NULL;
+        }
+    }
+    printf("[MatmulDecoder] Context pool: %d entries (from 7 projection types)\n", ctx->n_pool);
+
+    /* Create per-layer projections — only B weight is per-projection */
+    printf("[MatmulDecoder] Creating %d layers × 7 projections (pooled, B-only handles)...\n", num_layers);
 
     for (int i = 0; i < num_layers; i++) {
         LayerMatmulContext* lc = &ctx->layers[i];
-        int ret;
-
-        /* Attention projections */
-        ret = create_persistent_matmul(&lc->q_proj, 1, hidden_dim, num_q_heads * head_dim, quant_type);
-        if (ret != 0) { fprintf(stderr, "Layer %d q_proj failed\n", i); }
-
-        ret = create_persistent_matmul(&lc->k_proj, 1, hidden_dim, num_kv_heads * head_dim, quant_type);
-        if (ret != 0) { fprintf(stderr, "Layer %d k_proj failed\n", i); }
-
-        ret = create_persistent_matmul(&lc->v_proj, 1, hidden_dim, num_kv_heads * head_dim, quant_type);
-        if (ret != 0) { fprintf(stderr, "Layer %d v_proj failed\n", i); }
-
-        ret = create_persistent_matmul(&lc->o_proj, 1, num_q_heads * head_dim, hidden_dim, quant_type);
-        if (ret != 0) { fprintf(stderr, "Layer %d o_proj failed\n", i); }
-
-        /* FFN projections */
-        ret = create_persistent_matmul(&lc->gate_proj, 1, hidden_dim, ffn_dim, quant_type);
-        if (ret != 0) { fprintf(stderr, "Layer %d gate_proj failed\n", i); }
-
-        ret = create_persistent_matmul(&lc->up_proj, 1, hidden_dim, ffn_dim, quant_type);
-        if (ret != 0) { fprintf(stderr, "Layer %d up_proj failed\n", i); }
-
-        ret = create_persistent_matmul(&lc->down_proj, 1, ffn_dim, hidden_dim, quant_type);
-        if (ret != 0) { fprintf(stderr, "Layer %d down_proj failed\n", i); }
+        PersistentMatmul* pms[] = {
+            &lc->q_proj, &lc->k_proj, &lc->v_proj, &lc->o_proj,
+            &lc->gate_proj, &lc->up_proj, &lc->down_proj
+        };
+        for (int p = 0; p < 7; p++) {
+            int ret = create_pooled_matmul(pms[p], &ctx->pool[proj_pool_idx[p]]);
+            if (ret != 0) {
+                fprintf(stderr, "Layer %d %s failed\n", i, proj_defs[p].name);
+            }
+        }
 
         /* Load weights for this layer */
         snprintf(path, sizeof(path), "%s/layer_%02d", model_dir, i);
-        ret = load_layer_weights(lc, path, hidden_dim, num_q_heads, num_kv_heads, head_dim, ffn_dim, quant_type, config->has_qk_norm);
+        int ret = load_layer_weights(lc, path, hidden_dim, num_q_heads, num_kv_heads, head_dim, ffn_dim, quant_type, config->has_qk_norm);
         if (ret != 0) {
             fprintf(stderr, "[MatmulDecoder] Failed to load layer %d weights\n", i);
         }
     }
 
-    printf("[MatmulDecoder] Loaded %d layer weights (qk_norm=%d)\n", num_layers, config->has_qk_norm);
+    int total_handles = ctx->n_pool * 3 + num_layers * 7;  /* pool(ctx+A+C) + per-layer B */
+    printf("[MatmulDecoder] Loaded %d layers (qk_norm=%d), NPU handles: %d (pool=%d + B=%d)\n",
+           num_layers, config->has_qk_norm, total_handles, ctx->n_pool * 3, num_layers * 7);
 
     /* KV cache */
     ctx->kv_cache = matmul_kv_cache_create(num_layers, num_kv_heads, head_dim, max_seq_len);
@@ -650,35 +795,40 @@ MatmulDecoderContext* matmul_decoder_create_from_weights(
         return NULL;
     }
 
-    /* Create persistent matmul contexts for each layer */
-    printf("[MatmulDecoder] Creating %d layer matmul contexts...\n", num_layers);
+    /* Build context pool (same as matmul_decoder_create) */
+    ctx->n_pool = 0;
+    {
+        int dims[][2] = {
+            {hidden_dim, num_q_heads * head_dim},   /* q */
+            {hidden_dim, num_kv_heads * head_dim},  /* k, v */
+            {num_q_heads * head_dim, hidden_dim},   /* o */
+            {hidden_dim, ffn_dim},                  /* gate, up */
+            {ffn_dim, hidden_dim},                  /* down */
+        };
+        for (int d = 0; d < 5; d++) {
+            pool_get_or_create(ctx->pool, &ctx->n_pool, dims[d][0], dims[d][1], quant_type);
+        }
+    }
 
+    /* Create pooled projections for each layer */
     for (int i = 0; i < num_layers; i++) {
         LayerMatmulContext* lc = &ctx->layers[i];
-        int ret;
-
-        /* Attention projections */
-        ret = create_persistent_matmul(&lc->q_proj, 1, hidden_dim, num_q_heads * head_dim, quant_type);
-        if (ret != 0) { fprintf(stderr, "Layer %d q_proj failed\n", i); }
-
-        ret = create_persistent_matmul(&lc->k_proj, 1, hidden_dim, num_kv_heads * head_dim, quant_type);
-        if (ret != 0) { fprintf(stderr, "Layer %d k_proj failed\n", i); }
-
-        ret = create_persistent_matmul(&lc->v_proj, 1, hidden_dim, num_kv_heads * head_dim, quant_type);
-        if (ret != 0) { fprintf(stderr, "Layer %d v_proj failed\n", i); }
-
-        ret = create_persistent_matmul(&lc->o_proj, 1, num_q_heads * head_dim, hidden_dim, quant_type);
-        if (ret != 0) { fprintf(stderr, "Layer %d o_proj failed\n", i); }
-
-        /* FFN projections */
-        ret = create_persistent_matmul(&lc->gate_proj, 1, hidden_dim, ffn_dim, quant_type);
-        if (ret != 0) { fprintf(stderr, "Layer %d gate_proj failed\n", i); }
-
-        ret = create_persistent_matmul(&lc->up_proj, 1, hidden_dim, ffn_dim, quant_type);
-        if (ret != 0) { fprintf(stderr, "Layer %d up_proj failed\n", i); }
-
-        ret = create_persistent_matmul(&lc->down_proj, 1, ffn_dim, hidden_dim, quant_type);
-        if (ret != 0) { fprintf(stderr, "Layer %d down_proj failed\n", i); }
+        struct { PersistentMatmul* pm; int K; int N; } proj_list[] = {
+            {&lc->q_proj,    hidden_dim, num_q_heads * head_dim},
+            {&lc->k_proj,    hidden_dim, num_kv_heads * head_dim},
+            {&lc->v_proj,    hidden_dim, num_kv_heads * head_dim},
+            {&lc->o_proj,    num_q_heads * head_dim, hidden_dim},
+            {&lc->gate_proj, hidden_dim, ffn_dim},
+            {&lc->up_proj,   hidden_dim, ffn_dim},
+            {&lc->down_proj, ffn_dim, hidden_dim},
+        };
+        for (int p = 0; p < 7; p++) {
+            int pidx = pool_get_or_create(ctx->pool, &ctx->n_pool,
+                                           proj_list[p].K, proj_list[p].N, quant_type);
+            if (pidx >= 0) {
+                create_pooled_matmul(proj_list[p].pm, &ctx->pool[pidx]);
+            }
+        }
 
         /* Norm weights */
         lc->input_norm_w = malloc(hidden_dim * sizeof(float));
@@ -968,7 +1118,7 @@ void matmul_decoder_get_stats(const MatmulDecoderContext* ctx, MatmulDecoderStat
 void matmul_decoder_destroy(MatmulDecoderContext* ctx) {
     if (!ctx) return;
 
-    /* Destroy layer matmul contexts */
+    /* Destroy per-layer B weight handles (must come before pool destroy) */
     if (ctx->layers) {
         for (int i = 0; i < ctx->config.num_layers; i++) {
             LayerMatmulContext* lc = &ctx->layers[i];
@@ -986,6 +1136,9 @@ void matmul_decoder_destroy(MatmulDecoderContext* ctx) {
         }
         free(ctx->layers);
     }
+
+    /* Destroy shared pool contexts (ctx + A + C buffers) */
+    destroy_pool(ctx->pool, ctx->n_pool);
 
     /* Free other resources */
     matmul_kv_cache_destroy(ctx->kv_cache);
