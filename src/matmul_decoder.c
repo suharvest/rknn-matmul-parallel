@@ -765,19 +765,23 @@ MatmulDecoderContext* matmul_decoder_create(const char* model_dir,
     ctx->sin_table = malloc((size_t)max_seq_len * (head_dim / 2) * sizeof(float));
     precompute_rope_tables(ctx->cos_table, ctx->sin_table, max_seq_len, head_dim, config->rope_theta);
 
-    /* Working buffers */
+    /* Working buffers.
+     * CRITICAL: attn_out must be num_q_heads*head_dim, NOT hidden_dim.
+     * For Qwen3: hidden=1024 but q_dim=16*128=2048. Using hidden_dim
+     * causes heap overflow → malloc corruption after a few steps. */
+    int q_dim = num_q_heads * head_dim;   /* attention output dimension */
     ctx->hidden = aligned_alloc(64, hidden_dim * sizeof(float));
-    ctx->q_out = aligned_alloc(64, num_q_heads * head_dim * sizeof(float));
+    ctx->q_out = aligned_alloc(64, q_dim * sizeof(float));
     ctx->k_out = aligned_alloc(64, num_kv_heads * head_dim * sizeof(float));
     ctx->v_out = aligned_alloc(64, num_kv_heads * head_dim * sizeof(float));
-    ctx->attn_out = aligned_alloc(64, hidden_dim * sizeof(float));
+    ctx->attn_out = aligned_alloc(64, q_dim * sizeof(float));
     ctx->ffn_gate = aligned_alloc(64, ffn_dim * sizeof(float));
     ctx->ffn_up = aligned_alloc(64, ffn_dim * sizeof(float));
     ctx->ffn_down = aligned_alloc(64, hidden_dim * sizeof(float));
     ctx->logits = aligned_alloc(64, vocab_size * sizeof(float));
 
-    printf("[MatmulDecoder] Ready: %d layers, hidden=%d, heads=%d/%d, ffn=%d\n",
-           num_layers, hidden_dim, num_q_heads, num_kv_heads, ffn_dim);
+    printf("[MatmulDecoder] Ready: %d layers, hidden=%d, q_dim=%d, heads=%d/%d, ffn=%d\n",
+           num_layers, hidden_dim, q_dim, num_q_heads, num_kv_heads, ffn_dim);
 
     return ctx;
 }
@@ -882,17 +886,18 @@ MatmulDecoderContext* matmul_decoder_create_from_weights(
     precompute_rope_tables(ctx->cos_table, ctx->sin_table, max_seq_len, head_dim, config->rope_theta);
 
     /* Working buffers */
+    int q_dim = num_q_heads * head_dim;
     ctx->hidden = aligned_alloc(64, hidden_dim * sizeof(float));
-    ctx->q_out = aligned_alloc(64, num_q_heads * head_dim * sizeof(float));
+    ctx->q_out = aligned_alloc(64, q_dim * sizeof(float));
     ctx->k_out = aligned_alloc(64, num_kv_heads * head_dim * sizeof(float));
     ctx->v_out = aligned_alloc(64, num_kv_heads * head_dim * sizeof(float));
-    ctx->attn_out = aligned_alloc(64, hidden_dim * sizeof(float));
+    ctx->attn_out = aligned_alloc(64, q_dim * sizeof(float));
     ctx->ffn_gate = aligned_alloc(64, ffn_dim * sizeof(float));
     ctx->ffn_up = aligned_alloc(64, ffn_dim * sizeof(float));
     ctx->ffn_down = aligned_alloc(64, hidden_dim * sizeof(float));
     ctx->logits = aligned_alloc(64, vocab_size * sizeof(float));
 
-    printf("[MatmulDecoder] Created: %d layers, hidden=%d, heads=%d/%d, ffn=%d\n",
+    printf("[MatmulDecoder] Created: %d layers, hidden=%d, q_dim=%d, heads=%d/%d, ffn=%d\n", q_dim,
            num_layers, hidden_dim, num_q_heads, num_kv_heads, ffn_dim);
 
     return ctx;
