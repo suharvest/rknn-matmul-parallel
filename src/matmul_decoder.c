@@ -37,6 +37,7 @@ typedef struct {
     int initialized;
     int is_pooled;          /* 1 = ctx/A/C are shared, only destroy B */
     int output_is_fp32;     /* 1 = C output is FP32 (FLOAT16_TO_FLOAT32) */
+    float* col_scales;      /* Per-column W4A16 scales [N] (NULL for FP16) */
     rknn_matmul_info* pool_info;  /* Points to pool's info (for B layout conversion) */
 } PersistentMatmul;
 
@@ -282,6 +283,7 @@ static int create_persistent_matmul(PersistentMatmul* pm, int M, int K, int N,
 static void destroy_persistent_matmul(PersistentMatmul* pm) {
     if (!pm->initialized) return;
 
+    free(pm->col_scales);
     if (pm->is_pooled) {
         /* Pooled: only destroy B (ctx/A/C are shared via pool) */
         if (pm->mem_B) rknn_destroy_mem(pm->ctx, pm->mem_B);
@@ -324,10 +326,26 @@ static int run_persistent_matmul(PersistentMatmul* pm, const float* input_fp32, 
         return MATMUL_DECODER_ERR_RKNN;
     }
 
-    /* Read output */
+    /* Read output and apply per-column scales if W4A16 */
     if (pm->output_is_fp32) {
+        /* FLOAT16_TO_FLOAT32: C is already FP32 */
         memcpy(output_fp32, pm->mem_C->virt_addr, N * sizeof(float));
+    } else if (pm->col_scales) {
+        /* INT4_TO_FLOAT16: convert FP16→FP32 and multiply per-column scales (NEON) */
+        const int16_t* src = (const int16_t*)pm->mem_C->virt_addr;
+        const float* scales = pm->col_scales;
+        int i;
+        for (i = 0; i <= N - 4; i += 4) {
+            float16x4_t h = vld1_f16((const __fp16*)(src + i));
+            float32x4_t f = vcvt_f32_f16(h);
+            float32x4_t s = vld1q_f32(scales + i);
+            vst1q_f32(output_fp32 + i, vmulq_f32(f, s));
+        }
+        for (; i < N; i++) {
+            output_fp32[i] = (float)(*(const __fp16*)(src + i)) * scales[i];
+        }
     } else {
+        /* FP16 output without scales */
         vec_fp16_to_fp32(output_fp32, (int16_t*)pm->mem_C->virt_addr, N);
     }
 
@@ -568,11 +586,11 @@ static int load_layer_weights(LayerMatmulContext* lc, const char* layer_dir,
                 continue;
             }
 
-            /* Load scales */
+            /* Load per-column scales for W4A16 dequantization */
             snprintf(path, sizeof(path), "%s/%s_scales.bin", layer_dir, projs[i].name);
-            float* scales = load_fp32_file(path, K);  /* Per-column scales */
-            if (!scales) {
-                fprintf(stderr, "[MatmulDecoder] Warning: Failed to load scales for %s\n", projs[i].name);
+            pm->col_scales = load_fp32_file(path, N);  /* [N] per-column scales */
+            if (!pm->col_scales) {
+                fprintf(stderr, "[MatmulDecoder] Warning: No scales for %s, INT4 output will be unscaled\n", projs[i].name);
             }
 
             /* Convert to native layout: w_data as input, mem_B as output */
@@ -580,7 +598,6 @@ static int load_layer_weights(LayerMatmulContext* lc, const char* layer_dir,
                                                      pm->K, pm->N, pm->pool_info);
 
             free(w_data);
-            free(scales);
         } else {
             /* Load FP16 weights */
             snprintf(path, sizeof(path), "%s/%s.bin", layer_dir, projs[i].name);
