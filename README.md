@@ -87,20 +87,6 @@ This library solves both: `iommu_domain_id=1` for isolation, context pooling for
 | + NPU tiled lm_head (FP16) | 125 | Split 151936 vocab into 38 tiles × (1024,4096), dedicated FP16 pool |
 | + NPU lm_head INT4 | **82** | Quantize lm_head tiles to INT4 at init, per-column scales via NEON |
 
-#### Related: Jetson TRT Optimizations (separate platform, same models)
-
-These optimizations were done on Jetson Orin NX for the same Qwen3 models:
-
-| Step | Before → After | Technique |
-|------|----------------|-----------|
-| TRT BF16 engines | FP16 NaN → BF16 correct | QK^T overflows FP16 (>65504), BF16 has FP32 exponent range |
-| GPU-resident KV cache | 40ms → 18ms/step | Double-buffer pointer swap, zero CPU-GPU memcpy |
-| Autoregressive CP fix | 30% CER → 0% CER | Parallel 15-code output was wrong; official is sequential autoregressive |
-| CP single-head | 62ms → 53ms/step (-15%) | `gen_step` selector: compute 1 of 15 lm_heads per step instead of all |
-| Vocoder TRT | 465ms → 98ms (4.7×) | ORT CUDA → TRT FP16, 25-frame streaming context |
-| Batch prefill | 200ms → 15ms (13×) | CPU ORT iterative → GPU TRT batch |
-| TTS RTF | 0.84 → 0.33 (2.5×) | All above combined |
-
 </details>
 
 **Summary:**
