@@ -36,6 +36,7 @@ typedef struct {
     int K, N;
     int initialized;
     int is_pooled;          /* 1 = ctx/A/C are shared, only destroy B */
+    int output_is_fp32;     /* 1 = C output is FP32 (FLOAT16_TO_FLOAT32) */
     rknn_matmul_info* pool_info;  /* Points to pool's info (for B layout conversion) */
 } PersistentMatmul;
 
@@ -105,16 +106,21 @@ struct MatmulDecoderContext {
     float* cos_table;           /* [max_seq_len, head_dim/2] */
     float* sin_table;
 
+    /* Final norm weight (separate from per-layer norms) */
+    float* final_norm_w;        /* [hidden_dim] */
+
     /* Working buffers */
     float* hidden;              /* [hidden_dim] */
-    float* q_out;               /* [num_q_heads, head_dim] */
-    float* k_out;               /* [num_kv_heads, head_dim] */
-    float* v_out;               /* [num_kv_heads, head_dim] */
-    float* attn_out;            /* [hidden_dim] */
+    float* residual;            /* [hidden_dim] — saves hidden for residual connection */
+    float* normed;              /* [hidden_dim] — normalized intermediate */
+    float* q_out;               /* [num_q_heads * head_dim] */
+    float* k_out;               /* [num_kv_heads * head_dim] */
+    float* v_out;               /* [num_kv_heads * head_dim] */
+    float* attn_out;            /* [num_q_heads * head_dim] */
     float* ffn_gate;            /* [ffn_dim] */
     float* ffn_up;              /* [ffn_dim] */
     float* ffn_down;            /* [hidden_dim] */
-    float* logits;              /* [vocab_size] */
+    float* logits;              /* [max(vocab_size, lm_head_vocab_size)] */
 
     /* Execution mode */
     ExecutionMode exec_mode;
@@ -223,6 +229,7 @@ static int create_pooled_matmul(PersistentMatmul* pm, MatmulPoolEntry* pe) {
     pm->N = pe->N;
     pm->initialized = 1;
     pm->is_pooled = 1;
+    pm->output_is_fp32 = (pe->info.type == RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32);
     pm->pool_info = &pe->info;
 
     return MATMUL_DECODER_OK;
@@ -266,6 +273,8 @@ static int create_persistent_matmul(PersistentMatmul* pm, int M, int K, int N,
     pm->N = N;
     pm->initialized = 1;
     pm->is_pooled = 0;
+    pm->output_is_fp32 = (info.type == RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32);
+    pm->pool_info = NULL;
 
     return MATMUL_DECODER_OK;
 }
@@ -315,14 +324,10 @@ static int run_persistent_matmul(PersistentMatmul* pm, const float* input_fp32, 
         return MATMUL_DECODER_ERR_RKNN;
     }
 
-    /* Read output — FP16 types output FP32 on RK3576 (FLOAT16_TO_FLOAT32),
-     * INT4/INT8 types output FP16 */
-    if (pm->pool_info &&
-        (pm->pool_info->type == RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32)) {
-        /* C is already FP32 */
+    /* Read output */
+    if (pm->output_is_fp32) {
         memcpy(output_fp32, pm->mem_C->virt_addr, N * sizeof(float));
     } else {
-        /* C is FP16, convert */
         vec_fp16_to_fp32(output_fp32, (int16_t*)pm->mem_C->virt_addr, N);
     }
 
@@ -753,9 +758,24 @@ MatmulDecoderContext* matmul_decoder_create(const char* model_dir,
         }
     }
 
-    int total_handles = ctx->n_pool * 3 + num_layers * 7;  /* pool(ctx+A+C) + per-layer B */
+    int total_handles = ctx->n_pool * 3 + num_layers * 7;
     printf("[MatmulDecoder] Loaded %d layers (qk_norm=%d), NPU handles: %d (pool=%d + B=%d)\n",
            num_layers, config->has_qk_norm, total_handles, ctx->n_pool * 3, num_layers * 7);
+
+    /* Load final norm weight (model.norm, separate from per-layer norms) */
+    snprintf(path, sizeof(path), "%s/final_norm.bin", model_dir);
+    ctx->final_norm_w = load_fp32_file(path, hidden_dim);
+    if (!ctx->final_norm_w) {
+        snprintf(path, sizeof(path), "%s/model_norm.bin", model_dir);
+        ctx->final_norm_w = load_fp32_file(path, hidden_dim);
+    }
+    if (!ctx->final_norm_w) {
+        /* Fallback: use last layer's post_attn_norm (incorrect but avoids crash) */
+        fprintf(stderr, "[MatmulDecoder] WARNING: final_norm.bin not found, using last layer post_norm\n");
+        ctx->final_norm_w = ctx->layers[num_layers - 1].post_attn_norm_w;
+    } else {
+        printf("[MatmulDecoder] Loaded final_norm weight\n");
+    }
 
     /* KV cache */
     ctx->kv_cache = matmul_kv_cache_create(num_layers, num_kv_heads, head_dim, max_seq_len);
@@ -765,12 +785,15 @@ MatmulDecoderContext* matmul_decoder_create(const char* model_dir,
     ctx->sin_table = malloc((size_t)max_seq_len * (head_dim / 2) * sizeof(float));
     precompute_rope_tables(ctx->cos_table, ctx->sin_table, max_seq_len, head_dim, config->rope_theta);
 
-    /* Working buffers.
-     * CRITICAL: attn_out must be num_q_heads*head_dim, NOT hidden_dim.
-     * For Qwen3: hidden=1024 but q_dim=16*128=2048. Using hidden_dim
-     * causes heap overflow → malloc corruption after a few steps. */
-    int q_dim = num_q_heads * head_dim;   /* attention output dimension */
+    /* Working buffers */
+    int q_dim = num_q_heads * head_dim;
+    int logits_size = vocab_size;
+    if (n_lm > 1 && config->lm_head_vocab_size > logits_size) {
+        logits_size = config->lm_head_vocab_size;
+    }
     ctx->hidden = aligned_alloc(64, hidden_dim * sizeof(float));
+    ctx->residual = aligned_alloc(64, hidden_dim * sizeof(float));
+    ctx->normed = aligned_alloc(64, hidden_dim * sizeof(float));
     ctx->q_out = aligned_alloc(64, q_dim * sizeof(float));
     ctx->k_out = aligned_alloc(64, num_kv_heads * head_dim * sizeof(float));
     ctx->v_out = aligned_alloc(64, num_kv_heads * head_dim * sizeof(float));
@@ -778,7 +801,7 @@ MatmulDecoderContext* matmul_decoder_create(const char* model_dir,
     ctx->ffn_gate = aligned_alloc(64, ffn_dim * sizeof(float));
     ctx->ffn_up = aligned_alloc(64, ffn_dim * sizeof(float));
     ctx->ffn_down = aligned_alloc(64, hidden_dim * sizeof(float));
-    ctx->logits = aligned_alloc(64, vocab_size * sizeof(float));
+    ctx->logits = aligned_alloc(64, logits_size * sizeof(float));
 
     printf("[MatmulDecoder] Ready: %d layers, hidden=%d, q_dim=%d, heads=%d/%d, ffn=%d\n",
            num_layers, hidden_dim, q_dim, num_q_heads, num_kv_heads, ffn_dim);
@@ -921,15 +944,19 @@ int matmul_decoder_step(MatmulDecoderContext* ctx,
     if (embedding) {
         memcpy(ctx->hidden, embedding, hidden_dim * sizeof(float));
     } else {
-        /* Lookup embedding */
         if (token_id < 0 || token_id >= vocab_size) {
             return MATMUL_DECODER_ERR_INVALID_ARG;
         }
         memcpy(ctx->hidden, ctx->embeddings + token_id * hidden_dim, hidden_dim * sizeof(float));
     }
 
-    /* Process each layer */
+    /* Bounds check: KV cache full */
     int seq_len = ctx->kv_cache->seq_len;
+    if (seq_len >= ctx->kv_cache->max_seq_len) {
+        fprintf(stderr, "[MatmulDecoder] KV cache full: seq_len=%d >= max=%d\n",
+                seq_len, ctx->kv_cache->max_seq_len);
+        return MATMUL_DECODER_ERR_INVALID_ARG;
+    }
 
     for (int layer = 0; layer < num_layers; layer++) {
         LayerMatmulContext* lc = &ctx->layers[layer];
@@ -938,16 +965,18 @@ int matmul_decoder_step(MatmulDecoderContext* ctx,
         float* layer_v_cache = ctx->kv_cache->v_cache +
             (layer * ctx->kv_cache->max_seq_len * num_kv_heads * head_dim);
 
+        /* Save hidden for residual connection */
+        memcpy(ctx->residual, ctx->hidden, hidden_dim * sizeof(float));
+
         /* Input norm */
-        float normed[hidden_dim];
-        rms_norm_f32(normed, ctx->hidden, lc->input_norm_w, hidden_dim, ctx->config.rms_eps);
+        rms_norm_f32(ctx->normed, ctx->hidden, lc->input_norm_w, hidden_dim, ctx->config.rms_eps);
 
         /* QKV projections */
-        run_persistent_matmul(&lc->q_proj, normed, ctx->q_out);
-        run_persistent_matmul(&lc->k_proj, normed, ctx->k_out);
-        run_persistent_matmul(&lc->v_proj, normed, ctx->v_out);
+        run_persistent_matmul(&lc->q_proj, ctx->normed, ctx->q_out);
+        run_persistent_matmul(&lc->k_proj, ctx->normed, ctx->k_out);
+        run_persistent_matmul(&lc->v_proj, ctx->normed, ctx->v_out);
 
-        /* QK norm: per-head RMSNorm on Q and K before RoPE */
+        /* QK norm */
         if (ctx->config.has_qk_norm && lc->q_norm_w && lc->k_norm_w) {
             for (int h = 0; h < num_q_heads; h++) {
                 float* q_head = ctx->q_out + h * head_dim;
@@ -959,7 +988,7 @@ int matmul_decoder_step(MatmulDecoderContext* ctx,
             }
         }
 
-        /* Apply RoPE */
+        /* RoPE */
         float* cos = ctx->cos_table + seq_len * (head_dim / 2);
         float* sin = ctx->sin_table + seq_len * (head_dim / 2);
         apply_rope_f32(ctx->q_out, cos, sin, num_q_heads, head_dim);
@@ -971,40 +1000,32 @@ int matmul_decoder_step(MatmulDecoderContext* ctx,
         memcpy(layer_v_cache + seq_len * num_kv_heads * head_dim, ctx->v_out,
                num_kv_heads * head_dim * sizeof(float));
 
-        /* Attention */
+        /* Attention → o_proj → attention residual */
         attention_f32(ctx->attn_out, ctx->q_out, layer_k_cache, layer_v_cache,
                       num_q_heads, num_kv_heads, head_dim, seq_len + 1);
-
-        /* Output projection */
         run_persistent_matmul(&lc->o_proj, ctx->attn_out, ctx->hidden);
+        vec_add_f32(ctx->hidden, ctx->residual, hidden_dim);
 
-        /* Residual */
-        vec_add_f32(ctx->hidden, ctx->attn_out, hidden_dim);
-
-        /* Post-attention norm */
-        rms_norm_f32(normed, ctx->hidden, lc->post_attn_norm_w, hidden_dim, ctx->config.rms_eps);
-
-        /* FFN */
-        run_persistent_matmul(&lc->gate_proj, normed, ctx->ffn_gate);
-        run_persistent_matmul(&lc->up_proj, normed, ctx->ffn_up);
+        /* Post-attention norm + FFN + FFN residual.
+         * FFN writes to ffn_down (not hidden), so hidden is preserved
+         * and vec_add_f32 correctly adds ffn_down as residual. */
+        rms_norm_f32(ctx->normed, ctx->hidden, lc->post_attn_norm_w, hidden_dim, ctx->config.rms_eps);
+        run_persistent_matmul(&lc->gate_proj, ctx->normed, ctx->ffn_gate);
+        run_persistent_matmul(&lc->up_proj, ctx->normed, ctx->ffn_up);
         silu_mul_f32(ctx->ffn_gate, ctx->ffn_gate, ctx->ffn_up, ffn_dim);
         run_persistent_matmul(&lc->down_proj, ctx->ffn_gate, ctx->ffn_down);
-
-        /* Residual */
         vec_add_f32(ctx->hidden, ctx->ffn_down, hidden_dim);
     }
 
-    /* Final norm (use last layer's post_attn_norm as final norm) */
-    float final_normed[hidden_dim];
-    rms_norm_f32(final_normed, ctx->hidden,
-                 ctx->layers[num_layers - 1].post_attn_norm_w, hidden_dim, ctx->config.rms_eps);
+    /* Final norm (dedicated weight, not per-layer) */
+    rms_norm_f32(ctx->normed, ctx->hidden,
+                 ctx->final_norm_w, hidden_dim, ctx->config.rms_eps);
 
-    /* LM head (simple matmul: [hidden_dim] @ [hidden_dim, vocab_size] */
-    /* TODO: Use persistent matmul for lm_head */
+    /* LM head: normed @ lm_head^T → logits */
     for (int v = 0; v < vocab_size; v++) {
         float sum = 0.0f;
         for (int h = 0; h < hidden_dim; h++) {
-            sum += final_normed[h] * ctx->lm_head[v * hidden_dim + h];
+            sum += ctx->normed[h] * ctx->lm_head[v * hidden_dim + h];
         }
         ctx->logits[v] = sum;
     }
@@ -1059,8 +1080,13 @@ int matmul_decoder_step_head(MatmulDecoderContext* ctx,
         memcpy(ctx->hidden, ctx->embeddings + token_id * hidden_dim, hidden_dim * sizeof(float));
     }
 
-    /* Process each layer (identical to matmul_decoder_step) */
+    /* Bounds check */
     int seq_len = ctx->kv_cache->seq_len;
+    if (seq_len >= ctx->kv_cache->max_seq_len) {
+        fprintf(stderr, "[MatmulDecoder] KV cache full: seq_len=%d >= max=%d\n",
+                seq_len, ctx->kv_cache->max_seq_len);
+        return MATMUL_DECODER_ERR_INVALID_ARG;
+    }
 
     for (int layer = 0; layer < num_layers; layer++) {
         LayerMatmulContext* lc = &ctx->layers[layer];
@@ -1069,12 +1095,12 @@ int matmul_decoder_step_head(MatmulDecoderContext* ctx,
         float* layer_v_cache = ctx->kv_cache->v_cache +
             (layer * ctx->kv_cache->max_seq_len * num_kv_heads * head_dim);
 
-        float normed[hidden_dim];
-        rms_norm_f32(normed, ctx->hidden, lc->input_norm_w, hidden_dim, ctx->config.rms_eps);
+        memcpy(ctx->residual, ctx->hidden, hidden_dim * sizeof(float));
+        rms_norm_f32(ctx->normed, ctx->hidden, lc->input_norm_w, hidden_dim, ctx->config.rms_eps);
 
-        run_persistent_matmul(&lc->q_proj, normed, ctx->q_out);
-        run_persistent_matmul(&lc->k_proj, normed, ctx->k_out);
-        run_persistent_matmul(&lc->v_proj, normed, ctx->v_out);
+        run_persistent_matmul(&lc->q_proj, ctx->normed, ctx->q_out);
+        run_persistent_matmul(&lc->k_proj, ctx->normed, ctx->k_out);
+        run_persistent_matmul(&lc->v_proj, ctx->normed, ctx->v_out);
 
         if (ctx->config.has_qk_norm && lc->q_norm_w && lc->k_norm_w) {
             for (int h = 0; h < num_q_heads; h++) {
@@ -1099,31 +1125,27 @@ int matmul_decoder_step_head(MatmulDecoderContext* ctx,
 
         attention_f32(ctx->attn_out, ctx->q_out, layer_k_cache, layer_v_cache,
                       num_q_heads, num_kv_heads, head_dim, seq_len + 1);
-
         run_persistent_matmul(&lc->o_proj, ctx->attn_out, ctx->hidden);
-        vec_add_f32(ctx->hidden, ctx->attn_out, hidden_dim);
+        vec_add_f32(ctx->hidden, ctx->residual, hidden_dim);
 
-        rms_norm_f32(normed, ctx->hidden, lc->post_attn_norm_w, hidden_dim, ctx->config.rms_eps);
-
-        run_persistent_matmul(&lc->gate_proj, normed, ctx->ffn_gate);
-        run_persistent_matmul(&lc->up_proj, normed, ctx->ffn_up);
+        rms_norm_f32(ctx->normed, ctx->hidden, lc->post_attn_norm_w, hidden_dim, ctx->config.rms_eps);
+        run_persistent_matmul(&lc->gate_proj, ctx->normed, ctx->ffn_gate);
+        run_persistent_matmul(&lc->up_proj, ctx->normed, ctx->ffn_up);
         silu_mul_f32(ctx->ffn_gate, ctx->ffn_gate, ctx->ffn_up, ffn_dim);
         run_persistent_matmul(&lc->down_proj, ctx->ffn_gate, ctx->ffn_down);
-
         vec_add_f32(ctx->hidden, ctx->ffn_down, hidden_dim);
     }
 
     /* Final norm */
-    float final_normed[hidden_dim];
-    rms_norm_f32(final_normed, ctx->hidden,
-                 ctx->layers[num_layers - 1].post_attn_norm_w, hidden_dim, ctx->config.rms_eps);
+    rms_norm_f32(ctx->normed, ctx->hidden,
+                 ctx->final_norm_w, hidden_dim, ctx->config.rms_eps);
 
     /* Selected lm_head */
     const float* head_w = ctx->lm_heads[lm_head_idx];
     for (int v = 0; v < lm_vocab; v++) {
         float sum = 0.0f;
         for (int h = 0; h < hidden_dim; h++) {
-            sum += final_normed[h] * head_w[v * hidden_dim + h];
+            sum += ctx->normed[h] * head_w[v * hidden_dim + h];
         }
         ctx->logits[v] = sum;
     }
@@ -1193,9 +1215,16 @@ void matmul_decoder_destroy(MatmulDecoderContext* ctx) {
     } else if (!ctx->config.tie_word_embeddings) {
         free(ctx->lm_head);
     }
+    /* final_norm_w: only free if it's NOT a borrowed pointer from last layer */
+    if (ctx->final_norm_w && ctx->layers &&
+        ctx->final_norm_w != ctx->layers[ctx->config.num_layers - 1].post_attn_norm_w) {
+        free(ctx->final_norm_w);
+    }
     free(ctx->cos_table);
     free(ctx->sin_table);
     free(ctx->hidden);
+    free(ctx->residual);
+    free(ctx->normed);
     free(ctx->q_out);
     free(ctx->k_out);
     free(ctx->v_out);

@@ -193,6 +193,9 @@ void attention_f32(float* out, const float* q,
     /* Allocate scores buffer dynamically */
     float* scores = (float*)malloc(seq_len * sizeof(float));
 
+    /* KV cache layout: [seq_len, num_kv_heads, head_dim] (interleaved per position) */
+    int kv_stride = num_kv_heads * head_dim;  /* stride between positions */
+
     for (int h = 0; h < num_q_heads; h++) {
         int kv_h = h / groups;
         const float* qh = q + h * head_dim;
@@ -200,10 +203,8 @@ void attention_f32(float* out, const float* q,
         /* Compute attention scores: Q @ K^T */
         float max_score = -1e30f;
 
-        /* K cache layout: [num_kv_heads][max_seq_len][head_dim] - caller ensures contiguous */
-        /* For now, assume k_cache points to kv_h's data starting at position 0 */
         for (int s = 0; s < seq_len; s++) {
-            const float* ks = k_cache + s * head_dim;
+            const float* ks = k_cache + s * kv_stride + kv_h * head_dim;
 
             /* Dot product with NEON */
             float dot = 0.0f;
@@ -233,7 +234,7 @@ void attention_f32(float* out, const float* q,
         memset(oh, 0, head_dim * sizeof(float));
 
         for (int s = 0; s < seq_len; s++) {
-            const float* vs = v_cache + s * head_dim;
+            const float* vs = v_cache + s * kv_stride + kv_h * head_dim;
             float sc = scores[s];
 
             for (int d = 0; d <= head_dim - 4; d += 4) {
