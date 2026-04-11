@@ -991,8 +991,8 @@ int matmul_decoder_step(MatmulDecoderContext* ctx,
         /* RoPE */
         float* cos = ctx->cos_table + seq_len * (head_dim / 2);
         float* sin = ctx->sin_table + seq_len * (head_dim / 2);
-        apply_rope_f32(ctx->q_out, cos, sin, num_q_heads, head_dim);
-        apply_rope_f32(ctx->k_out, cos, sin, num_kv_heads, head_dim);
+        apply_rope_f32(ctx->q_out, cos, sin, num_q_heads, head_dim, ctx->config.rope_style);
+        apply_rope_f32(ctx->k_out, cos, sin, num_kv_heads, head_dim, ctx->config.rope_style);
 
         /* Store K, V in cache */
         memcpy(layer_k_cache + seq_len * num_kv_heads * head_dim, ctx->k_out,
@@ -1115,8 +1115,8 @@ int matmul_decoder_step_head(MatmulDecoderContext* ctx,
 
         float* cos = ctx->cos_table + seq_len * (head_dim / 2);
         float* sin = ctx->sin_table + seq_len * (head_dim / 2);
-        apply_rope_f32(ctx->q_out, cos, sin, num_q_heads, head_dim);
-        apply_rope_f32(ctx->k_out, cos, sin, num_kv_heads, head_dim);
+        apply_rope_f32(ctx->q_out, cos, sin, num_q_heads, head_dim, ctx->config.rope_style);
+        apply_rope_f32(ctx->k_out, cos, sin, num_kv_heads, head_dim, ctx->config.rope_style);
 
         memcpy(layer_k_cache + seq_len * num_kv_heads * head_dim, ctx->k_out,
                num_kv_heads * head_dim * sizeof(float));

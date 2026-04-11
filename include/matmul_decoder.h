@@ -70,6 +70,9 @@ typedef struct {
     /* Optional: normalization type */
     int norm_type;              /* 0=RMSNorm, 1=LayerNorm */
 
+    /* RoPE pairing style */
+    int rope_style;             /* 0=interleaved (Qwen3/LLaMA), 1=split-half (GPT-NeoX) */
+
     /* Optional: activation type */
     int ffn_act_type;           /* 0=SwiGLU, 1=GeGLU, 2=ReLU */
 

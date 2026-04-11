@@ -107,44 +107,59 @@ void rope_precompute(float* cos_tab, float* sin_tab, int max_seq_len, int head_d
 }
 
 void apply_rope_f32(float* x, const float* cos_tab, const float* sin_tab,
-                    int num_heads, int head_dim) {
+                    int num_heads, int head_dim, int rope_style) {
     int half = head_dim / 2;
 
     for (int h = 0; h < num_heads; h++) {
         float* hx = x + h * head_dim;
 
-        /* Process 4 pairs at a time */
-        for (int i = 0; i <= half - 4; i += 4) {
-            float32x4_t x0 = vld1q_f32(hx + i);          /* x[..., 0:half] */
-            float32x4_t x1 = vld1q_f32(hx + half + i);   /* x[..., half:] */
-            float32x4_t c  = vld1q_f32(cos_tab + i);
-            float32x4_t s  = vld1q_f32(sin_tab + i);
-
-            /* out0 = x0 * cos - x1 * sin */
-            /* out1 = x1 * cos + x0 * sin */
-            vst1q_f32(hx + i,        vmlsq_f32(vmulq_f32(x0, c), x1, s));
-            vst1q_f32(hx + half + i, vmlaq_f32(vmulq_f32(x1, c), x0, s));
-        }
-
-        /* Tail */
-        for (int i = half - (half % 4); i < half; i++) {
-            float x0 = hx[i];
-            float x1 = hx[half + i];
-            float c = cos_tab[i];
-            float s = sin_tab[i];
-            hx[i] = x0 * c - x1 * s;
-            hx[half + i] = x1 * c + x0 * s;
+        if (rope_style == 0) {
+            /* Interleaved (Qwen3/LLaMA): pair i = (x[2i], x[2i+1]) */
+            for (int i = 0; i <= half - 2; i += 2) {
+                float32x4_t xv = vld1q_f32(hx + i * 2);
+                float c0 = cos_tab[i], c1 = cos_tab[i + 1];
+                float s0 = sin_tab[i], s1 = sin_tab[i + 1];
+                float x0a = vgetq_lane_f32(xv, 0);
+                float x1a = vgetq_lane_f32(xv, 1);
+                float x0b = vgetq_lane_f32(xv, 2);
+                float x1b = vgetq_lane_f32(xv, 3);
+                float32x4_t out = {
+                    x0a * c0 - x1a * s0, x1a * c0 + x0a * s0,
+                    x0b * c1 - x1b * s1, x1b * c1 + x0b * s1
+                };
+                vst1q_f32(hx + i * 2, out);
+            }
+            if (half % 2) {
+                int i = half - 1;
+                float x0 = hx[2 * i], x1 = hx[2 * i + 1];
+                hx[2 * i]     = x0 * cos_tab[i] - x1 * sin_tab[i];
+                hx[2 * i + 1] = x1 * cos_tab[i] + x0 * sin_tab[i];
+            }
+        } else {
+            /* Split-half (GPT-NeoX): pair i = (x[i], x[i+half]) */
+            for (int i = 0; i <= half - 4; i += 4) {
+                float32x4_t x0 = vld1q_f32(hx + i);
+                float32x4_t x1 = vld1q_f32(hx + half + i);
+                float32x4_t c  = vld1q_f32(cos_tab + i);
+                float32x4_t s  = vld1q_f32(sin_tab + i);
+                vst1q_f32(hx + i,        vmlsq_f32(vmulq_f32(x0, c), x1, s));
+                vst1q_f32(hx + half + i, vmlaq_f32(vmulq_f32(x1, c), x0, s));
+            }
+            for (int i = half - (half % 4); i < half; i++) {
+                float x0 = hx[i], x1 = hx[half + i];
+                hx[i]        = x0 * cos_tab[i] - x1 * sin_tab[i];
+                hx[half + i] = x1 * cos_tab[i] + x0 * sin_tab[i];
+            }
         }
     }
 }
 
 void apply_rope_fp16(int16_t* x, const float* cos_tab, const float* sin_tab,
-                     int num_heads, int head_dim) {
-    /* Convert to FP32, apply, convert back */
+                     int num_heads, int head_dim, int rope_style) {
     int total = num_heads * head_dim;
     float* x_f32 = (float*)malloc(total * sizeof(float));
     vec_fp16_to_fp32(x_f32, x, total);
-    apply_rope_f32(x_f32, cos_tab, sin_tab, num_heads, head_dim);
+    apply_rope_f32(x_f32, cos_tab, sin_tab, num_heads, head_dim, rope_style);
     vec_fp32_to_fp16(x, x_f32, total);
     free(x_f32);
 }

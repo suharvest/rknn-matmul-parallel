@@ -66,15 +66,17 @@ void rope_precompute(float* cos_tab, float* sin_tab, int max_seq_len, int head_d
  * @param sin_tab     Precomputed sin table [head_dim / 2]
  * @param num_heads   Number of attention heads
  * @param head_dim    Dimension per head
+ * @param rope_style  0=interleaved (Qwen3/LLaMA: pair 2i,2i+1)
+ *                    1=split-half (GPT-NeoX: pair i,i+half)
  */
 void apply_rope_f32(float* x, const float* cos_tab, const float* sin_tab,
-                    int num_heads, int head_dim);
+                    int num_heads, int head_dim, int rope_style);
 
 /**
  * Apply RoPE to FP16 tensor.
  */
 void apply_rope_fp16(int16_t* x, const float* cos_tab, const float* sin_tab,
-                     int num_heads, int head_dim);
+                     int num_heads, int head_dim, int rope_style);
 
 /* ─── Softmax ─── */
 
