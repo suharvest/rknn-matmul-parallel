@@ -27,6 +27,7 @@
 #include <string.h>
 #include <pthread.h>
 #include <time.h>
+#include <unistd.h>
 
 /* ============================================================================
  * Internal structures
@@ -79,11 +80,18 @@ typedef struct {
     WorkerState workers[RMP_MAX_WORKERS];
 } SharedState;
 
+/* Per-thread argument (stable pointer, not a temporary field) */
+typedef struct {
+    SharedState* shm;
+    int worker_id;
+} ThreadArg;
+
 /* Internal context structure */
 struct RmpContext {
     SharedState* shm;
     RmpConfig config;
     float last_benchmark_ms;
+    ThreadArg thread_args[RMP_MAX_WORKERS];
 };
 
 /* ============================================================================
@@ -99,8 +107,9 @@ static rknn_matmul_type to_rknn_type(RmpMatmulType type) {
 }
 
 static void* worker_thread_func(void* arg) {
-    SharedState* shm = (SharedState*)arg;
-    int worker_id = shm->workers[shm->worker_id].worker_id;
+    ThreadArg* targ = (ThreadArg*)arg;
+    SharedState* shm = targ->shm;
+    int worker_id = targ->worker_id;
     WorkerState* ws = &shm->workers[worker_id];
 
     int M = shm->M;
@@ -253,9 +262,9 @@ RmpContext* rmp_create(const RmpConfig* config, const void* weights, const float
 
     /* Create worker threads */
     for (int i = 0; i < n_workers; i++) {
-        /* Temporarily set worker_id for thread to read */
-        shm->worker_id = i;
-        int ret = pthread_create(&shm->threads[i], NULL, worker_thread_func, shm);
+        ctx->thread_args[i].shm = shm;
+        ctx->thread_args[i].worker_id = i;
+        int ret = pthread_create(&shm->threads[i], NULL, worker_thread_func, &ctx->thread_args[i]);
         if (ret != 0) {
             fprintf(stderr, "pthread_create failed for worker %d: %d\n", i, ret);
             /* Signal existing workers to exit */
