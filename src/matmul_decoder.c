@@ -13,6 +13,7 @@
 #include <string.h>
 #include <math.h>
 #include <arm_neon.h>
+#include <sys/stat.h>
 
 /* ─── Internal Structures ─── */
 
@@ -468,8 +469,12 @@ static int load_layer_weights(LayerMatmulContext* lc, const char* layer_dir,
         lc->input_norm_w = load_fp32_file(path, hidden_dim);
     }
 
-    snprintf(path, sizeof(path), "%s/post_norm.bin", layer_dir);
+    snprintf(path, sizeof(path), "%s/post_attn_norm.bin", layer_dir);
     lc->post_attn_norm_w = load_fp32_file(path, hidden_dim);
+    if (!lc->post_attn_norm_w) {
+        snprintf(path, sizeof(path), "%s/post_norm.bin", layer_dir);
+        lc->post_attn_norm_w = load_fp32_file(path, hidden_dim);
+    }
     if (!lc->post_attn_norm_w) {
         snprintf(path, sizeof(path), "%s/post_attn_norm_weight.bin", layer_dir);
         lc->post_attn_norm_w = load_fp32_file(path, hidden_dim);
@@ -536,6 +541,7 @@ static int load_layer_weights(LayerMatmulContext* lc, const char* layer_dir,
                 int16_t* fp16_data = load_fp16_file(path, (size_t)K * N);
                 if (fp16_data) {
                     memcpy(pm->mem_B->virt_addr, fp16_data, K * N * sizeof(int16_t));
+                    rknn_B_normal_layout_to_native_layout(pm->ctx, pm->mem_B, &pm->io.B);
                     free(fp16_data);
                     continue;
                 }
@@ -550,12 +556,9 @@ static int load_layer_weights(LayerMatmulContext* lc, const char* layer_dir,
                 fprintf(stderr, "[MatmulDecoder] Warning: Failed to load scales for %s\n", projs[i].name);
             }
 
-            /* Copy packed weights to B memory */
-            /* RKNN expects B in [K, N] packed format */
+            /* Copy packed weights to B memory and convert to native layout */
             memcpy(pm->mem_B->virt_addr, w_data, (size_t)N * K / 2);
-
-            /* Store scales pointer for later use (in custom quantization) */
-            /* For now, RKNN handles INT4 internally if we pass the right type */
+            rknn_B_normal_layout_to_native_layout(pm->ctx, pm->mem_B, &pm->io.B);
 
             free(w_data);
             free(scales);
@@ -569,6 +572,7 @@ static int load_layer_weights(LayerMatmulContext* lc, const char* layer_dir,
             }
 
             memcpy(pm->mem_B->virt_addr, w_data, K * N * sizeof(int16_t));
+            rknn_B_normal_layout_to_native_layout(pm->ctx, pm->mem_B, &pm->io.B);
             free(w_data);
         }
     }
@@ -714,8 +718,19 @@ MatmulDecoderContext* matmul_decoder_create(const char* model_dir,
             }
         }
 
-        /* Load weights for this layer */
+        /* Load weights for this layer.
+         * Try "layers/layer_NN" first (new layout), fall back to "layer_NN". */
+        char path_alt[512];
+        snprintf(path_alt, sizeof(path_alt), "%s/layers/layer_%02d", model_dir, i);
         snprintf(path, sizeof(path), "%s/layer_%02d", model_dir, i);
+        {
+            /* Check if layers/ subdirectory exists by trying to stat it */
+            struct stat st;
+            if (stat(path_alt, &st) == 0 && S_ISDIR(st.st_mode)) {
+                /* Use the layers/ subdirectory layout */
+                snprintf(path, sizeof(path), "%s/layers/layer_%02d", model_dir, i);
+            }
+        }
         int ret = load_layer_weights(lc, path, hidden_dim, num_q_heads, num_kv_heads, head_dim, ffn_dim, quant_type, config->has_qk_norm);
         if (ret != 0) {
             fprintf(stderr, "[MatmulDecoder] Failed to load layer %d weights\n", i);
