@@ -102,7 +102,10 @@ static rknn_matmul_type to_rknn_type(RmpMatmulType type) {
     switch (type) {
         case RMP_TYPE_FP16_INT4: return RKNN_FLOAT16_MM_INT4_TO_FLOAT16;
         case RMP_TYPE_FP16_INT8: return RKNN_FLOAT16_MM_INT8_TO_FLOAT16;
-        default: return RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT16;
+        /* RK3576 doesn't support FP16→FP16, must use FP16→FP32.
+         * NOTE: output buffer is still int16_t* in rmp_run API.
+         * TODO: adapt rmp_run to handle FP32 output when type is FP16_FP16 */
+        default: return RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32;
     }
 }
 

@@ -129,11 +129,11 @@ struct MatmulDecoderContext {
 /* Map quantization type to RKNN matmul type */
 static rknn_matmul_type quant_to_rknn_type(QuantizationType quant_type) {
     switch (quant_type) {
-        case QUANT_FP16:     return RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT16;
+        case QUANT_FP16:     return RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32;
         case QUANT_INT4:
         case QUANT_INT4_G128: return RKNN_FLOAT16_MM_INT4_TO_FLOAT16;
         case QUANT_INT8:     return RKNN_FLOAT16_MM_INT8_TO_FLOAT16;
-        default:             return RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT16;
+        default:             return RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32;
     }
 }
 
@@ -315,8 +315,16 @@ static int run_persistent_matmul(PersistentMatmul* pm, const float* input_fp32, 
         return MATMUL_DECODER_ERR_RKNN;
     }
 
-    /* Convert output to FP32 */
-    vec_fp16_to_fp32(output_fp32, (int16_t*)pm->mem_C->virt_addr, N);
+    /* Read output — FP16 types output FP32 on RK3576 (FLOAT16_TO_FLOAT32),
+     * INT4/INT8 types output FP16 */
+    if (pm->pool_info &&
+        (pm->pool_info->type == RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32)) {
+        /* C is already FP32 */
+        memcpy(output_fp32, pm->mem_C->virt_addr, N * sizeof(float));
+    } else {
+        /* C is FP16, convert */
+        vec_fp16_to_fp32(output_fp32, (int16_t*)pm->mem_C->virt_addr, N);
+    }
 
     return MATMUL_DECODER_OK;
 }
