@@ -1010,7 +1010,7 @@ MatmulDecoderContext* matmul_decoder_create(const char* model_dir,
         /* Create dedicated FP16 pool with B_layout=0 (normal, no native conversion).
          * This avoids the rknn_B_normal_layout_to_native_layout issue and
          * lets us memcpy FP16 weights directly to B buffers. */
-        int tile_n = 2048;
+        int tile_n = 4096;
         if (ctx->n_pool < MAX_MATMUL_POOL) {
             int lm_pool_idx = ctx->n_pool++;
             MatmulPoolEntry* pe = &ctx->pool[lm_pool_idx];
