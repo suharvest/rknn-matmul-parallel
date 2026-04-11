@@ -52,37 +52,54 @@ This library solves both: `iommu_domain_id=1` for isolation, context pooling for
 <details>
 <summary>Full optimization history with technical details</summary>
 
-#### Phase 1: Make It Work
+#### Phase 1: Make It Work — Infrastructure
 
 | Step | What | Impact |
 |------|------|--------|
-| Context pooling | 196 per-layer contexts → 5 shared pools, B rebind per matmul | Handle count 784→211, bypasses `/dev/rknpu` 1020 limit |
+| Context pooling | 196 per-layer NPU contexts → 5 shared pools with B rebind | Handle count 784→211, bypasses `/dev/rknpu` ~1020 limit |
 | IOMMU domain isolation | `iommu_domain_id=1` separates matmul from RKNN models | Eliminates 6s timeout EINVAL from domain 0 contention |
-| B native layout conversion | `rknn_B_normal_layout_to_native_layout` with separate in/out buffers | In-place conversion corrupted weights silently |
+| B native layout conversion | `rknn_B_normal_layout_to_native_layout` with separate in/out buffers | In-place conversion corrupted all weights silently |
 | FP16→FP32 output | RK3576 NPU doesn't support `FLOAT16_TO_FLOAT16` | Changed to `FLOAT16_TO_FLOAT32`, fixed output read path |
-| W4A16 per-column scales | NPU INT4 uses per-layer scale; CPU applies per-column scales post-matmul | NEON-fused FP16→FP32 × scale in one pass |
+| W4A16 per-column scales | NPU INT4 uses per-layer scale; CPU applies per-column post-matmul | NEON-fused FP16→FP32 × scale in one pass |
+| INT8 weight loading | Unified INT4/INT8 quantized weight path | Consistent loading for all quant types |
 
-#### Phase 2: Make It Correct
+#### Phase 2: Make It Correct — 8 Critical Bugs
 
 | Step | What | Impact |
 |------|------|--------|
-| attn_out buffer overflow | Allocated `hidden_dim` (1024) but attention writes `q_dim` (2048) | Heap corruption → malloc crash after few steps |
-| Residual connection fix | `o_proj` was overwriting original hidden before residual add | Every token's output was wrong |
-| GQA attention fix | K/V cache indexing ignored `kv_head` offset | All 16 Q heads attended to KV head 0 only |
-| Final norm weight | Was using last layer's post_attn_norm instead of dedicated `final_norm.bin` | Wrong normalization before lm_head |
-| RoPE interleaved mode | Was using split-half (GPT-NeoX) instead of interleaved (Qwen3/LLaMA) | Completely broken attention scores |
-| KV cache bounds check | No check for `seq_len >= max_seq_len` | Silent buffer overflow |
+| attn_out buffer overflow | Allocated `hidden_dim` (1024) but attention writes `q_dim` (2048) | 2× heap overflow → malloc crash after few steps |
+| Residual connection | `o_proj` was overwriting original hidden before residual add | Every token output wrong (hidden state destroyed) |
+| GQA attention indexing | K/V cache read ignored `kv_head` stride offset | All 16 Q heads attended to KV head 0 only |
+| Final norm weight | Used last layer's post_attn_norm instead of dedicated `final_norm.bin` | Wrong normalization before lm_head |
+| RoPE pairing style | Hardcoded split-half (GPT-NeoX) instead of interleaved (Qwen3/LLaMA) | Completely broken attention scores, added configurable `rope_style` |
+| KV cache bounds check | No check for `seq_len >= max_seq_len` | Silent buffer overflow → crash on long sequences |
+| Non-pooled FP32 detection | `pool_info` NULL for standalone mode → wrong FP16 output conversion | Garbage output in dedicated context mode |
+| VLA stack overflow | `float normed[hidden_dim]` on stack for large models | Replaced with heap-allocated `ctx->normed`, `ctx->residual` |
 
-#### Phase 3: Make It Fast
+#### Phase 3: Make It Fast — Performance (461ms → 82ms)
 
 | Step | ms/token | Technique |
 |------|----------|-----------|
-| Baseline | 461 | Naive C loops, CPU lm_head |
-| + NEON GEMV for lm_head | 335 | 4-wide FMA, 4 vocab entries per iteration |
-| + FP16 GEMV | 259 | FP16 weights halve memory bandwidth |
-| + W4A16 layer quantization | 167 | INT4 matmul 2.7× faster than FP16 on NPU |
-| + NPU tiled lm_head | 125 | 38 tiles × (1024,4096), reuse pool context |
-| + INT4 lm_head quantization | **82** | Per-column INT4 quantized at init, scales applied via NEON |
+| Baseline | 461 | Naive C loops, CPU scalar lm_head (151936 × 1024 dot products) |
+| + NEON GEMV for lm_head | 335 | `vfmaq_f32` 4-wide FMA, process 4 vocab entries per iteration |
+| + FP16 GEMV weights | 259 | Pre-convert lm_head to FP16 at init, halve memory bandwidth |
+| + W4A16 layer quantization | 167 | Per-column INT4 weights, NPU INT4 matmul 2.7× faster than FP16 |
+| + NPU tiled lm_head (FP16) | 125 | Split 151936 vocab into 38 tiles × (1024,4096), dedicated FP16 pool |
+| + NPU lm_head INT4 | **82** | Quantize lm_head tiles to INT4 at init, per-column scales via NEON |
+
+#### Related: Jetson TRT Optimizations (separate platform, same models)
+
+These optimizations were done on Jetson Orin NX for the same Qwen3 models:
+
+| Step | Before → After | Technique |
+|------|----------------|-----------|
+| TRT BF16 engines | FP16 NaN → BF16 correct | QK^T overflows FP16 (>65504), BF16 has FP32 exponent range |
+| GPU-resident KV cache | 40ms → 18ms/step | Double-buffer pointer swap, zero CPU-GPU memcpy |
+| Autoregressive CP fix | 30% CER → 0% CER | Parallel 15-code output was wrong; official is sequential autoregressive |
+| CP single-head | 62ms → 53ms/step (-15%) | `gen_step` selector: compute 1 of 15 lm_heads per step instead of all |
+| Vocoder TRT | 465ms → 98ms (4.7×) | ORT CUDA → TRT FP16, 25-frame streaming context |
+| Batch prefill | 200ms → 15ms (13×) | CPU ORT iterative → GPU TRT batch |
+| TTS RTF | 0.84 → 0.33 (2.5×) | All above combined |
 
 </details>
 
@@ -90,9 +107,9 @@ This library solves both: `iommu_domain_id=1` for isolation, context pooling for
 
 | Optimization | ms/token | Improvement |
 |-------------|----------|-------------|
-| Baseline | 461 | — |
+| Baseline (naive) | 461 | — |
 | + ARM NEON CPU ops | 335 | -27% |
-| + W4A16 quantization | 167 | -50% |
+| + W4A16 layer quantization | 167 | -50% |
 | + NPU tiled lm_head (INT4) | **82** | **-51%** |
 
 ### Why 82ms vs RKLLM 43ms?
@@ -149,14 +166,16 @@ Per-step: ~6ms
 
 ### Matcha-TTS — Non-autoregressive acoustic model
 
-```
-Matcha:   RKNN FP16             → 470ms
-Vocos:    RKNN FP16             → 250ms
-ISTFT:    CPU                   → 190ms
-Total:    1.76s, RTF 0.054
-```
+Measured on RK3576 (30 phonemes → 8.96s audio @ 22kHz):
 
-*Matcha and Vocos run as RKNN models on domain 0, this library's decoder runs on domain 1 — no conflict.*
+| Stage | Time | Method |
+|-------|------|--------|
+| Matcha acoustic (230 diffusion steps) | 601ms | RKNN FP16, NPU |
+| Vocos vocoder | 263ms | RKNN FP16, NPU |
+| ISTFT reconstruction | 43ms | numpy CPU |
+| **Total** | **906ms** | **RTF 0.10** |
+
+*Matcha and Vocos run as RKNN models on IOMMU domain 0. This library's matmul decoder runs on domain 1 — zero conflict, simultaneous ASR + TTS possible.*
 
 ## Quick Start
 
