@@ -558,8 +558,8 @@ static int load_layer_weights(LayerMatmulContext* lc, const char* layer_dir,
                 snprintf(path, sizeof(path), "%s/%s.bin", layer_dir, projs[i].name);
                 int16_t* fp16_data = load_fp16_file(path, (size_t)K * N);
                 if (fp16_data) {
-                    memcpy(pm->mem_B->virt_addr, fp16_data, K * N * sizeof(int16_t));
-                    rknn_B_normal_layout_to_native_layout(pm->mem_B->virt_addr, pm->mem_B->virt_addr,
+                    /* Use fp16_data as input, mem_B as output (NOT in-place) */
+                    rknn_B_normal_layout_to_native_layout(fp16_data, pm->mem_B->virt_addr,
                                                          pm->K, pm->N, pm->pool_info);
                     free(fp16_data);
                     continue;
@@ -575,9 +575,8 @@ static int load_layer_weights(LayerMatmulContext* lc, const char* layer_dir,
                 fprintf(stderr, "[MatmulDecoder] Warning: Failed to load scales for %s\n", projs[i].name);
             }
 
-            /* Copy packed weights to B memory and convert to native layout */
-            memcpy(pm->mem_B->virt_addr, w_data, (size_t)N * K / 2);
-            rknn_B_normal_layout_to_native_layout(pm->mem_B->virt_addr, pm->mem_B->virt_addr,
+            /* Convert to native layout: w_data as input, mem_B as output */
+            rknn_B_normal_layout_to_native_layout(w_data, pm->mem_B->virt_addr,
                                                      pm->K, pm->N, pm->pool_info);
 
             free(w_data);
@@ -591,8 +590,8 @@ static int load_layer_weights(LayerMatmulContext* lc, const char* layer_dir,
                 continue;
             }
 
-            memcpy(pm->mem_B->virt_addr, w_data, K * N * sizeof(int16_t));
-            rknn_B_normal_layout_to_native_layout(pm->mem_B->virt_addr, pm->mem_B->virt_addr,
+            /* Convert to native layout: w_data as input, mem_B as output */
+            rknn_B_normal_layout_to_native_layout(w_data, pm->mem_B->virt_addr,
                                                      pm->K, pm->N, pm->pool_info);
             free(w_data);
         }
