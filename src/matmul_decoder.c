@@ -495,6 +495,8 @@ static int load_layer_weights(LayerMatmulContext* lc, const char* layer_dir,
                                int has_qk_norm) {
     char path[512];
     int is_int4 = (quant_type == QUANT_INT4 || quant_type == QUANT_INT4_G128);
+    int is_int8 = (quant_type == QUANT_INT8);
+    int is_quantized = is_int4 || is_int8;
 
     /* Load norm weights (FP32) */
     snprintf(path, sizeof(path), "%s/input_norm.bin", layer_dir);
@@ -567,36 +569,36 @@ static int load_layer_weights(LayerMatmulContext* lc, const char* layer_dir,
         int N = projs[i].N;
         PersistentMatmul* pm = projs[i].pm;
 
-        if (is_int4) {
-            /* Load INT4 packed weights (uint8) */
+        if (is_quantized) {
+            /* Load quantized weights: INT4 (packed uint8, K*N/2) or INT8 (uint8, K*N) */
             snprintf(path, sizeof(path), "%s/%s_weight.bin", layer_dir, projs[i].name);
-            uint8_t* w_data = load_uint8_file(path, (size_t)N * K / 2);  /* Packed: N*K bits = N*K/2 bytes */
+            size_t w_bytes = is_int4 ? (size_t)N * K / 2 : (size_t)N * K;
+            uint8_t* w_data = load_uint8_file(path, w_bytes);
             if (!w_data) {
                 /* Try FP16 fallback */
                 snprintf(path, sizeof(path), "%s/%s.bin", layer_dir, projs[i].name);
                 int16_t* fp16_data = load_fp16_file(path, (size_t)K * N);
                 if (fp16_data) {
-                    /* Use fp16_data as input, mem_B as output (NOT in-place) */
                     rknn_B_normal_layout_to_native_layout(fp16_data, pm->mem_B->virt_addr,
                                                          pm->K, pm->N, pm->pool_info);
                     free(fp16_data);
+                    pm->col_scales = NULL;
                     continue;
                 }
                 fprintf(stderr, "[MatmulDecoder] Warning: Failed to load %s\n", path);
                 continue;
             }
 
-            /* Load per-column scales for W4A16 dequantization */
+            /* Load per-column scales (needed for both INT4 and INT8) */
             snprintf(path, sizeof(path), "%s/%s_scales.bin", layer_dir, projs[i].name);
-            pm->col_scales = load_fp32_file(path, N);  /* [N] per-column scales */
+            pm->col_scales = load_fp32_file(path, N);
             if (!pm->col_scales) {
-                fprintf(stderr, "[MatmulDecoder] Warning: No scales for %s, INT4 output will be unscaled\n", projs[i].name);
+                fprintf(stderr, "[MatmulDecoder] Warning: No scales for %s, output will be unscaled\n", projs[i].name);
             }
 
-            /* Convert to native layout: w_data as input, mem_B as output */
+            /* Convert to native layout */
             rknn_B_normal_layout_to_native_layout(w_data, pm->mem_B->virt_addr,
                                                      pm->K, pm->N, pm->pool_info);
-
             free(w_data);
         } else {
             /* Load FP16 weights */
@@ -607,10 +609,10 @@ static int load_layer_weights(LayerMatmulContext* lc, const char* layer_dir,
                 continue;
             }
 
-            /* Convert to native layout: w_data as input, mem_B as output */
             rknn_B_normal_layout_to_native_layout(w_data, pm->mem_B->virt_addr,
                                                      pm->K, pm->N, pm->pool_info);
             free(w_data);
+            pm->col_scales = NULL;
         }
     }
 
