@@ -21,6 +21,7 @@ LDFLAGS = -L$(RKNN_SDK_PATH)/lib -lrknnrt -lpthread -lm
 # Python binding
 PYTHON = python3
 PYBIND_INCLUDE = $(shell $(PYTHON) -c "import pybind11; print(pybind11.get_include())")
+PYTHON_INCLUDE = $(shell $(PYTHON) -c "import sysconfig; print(sysconfig.get_path('include'))")
 
 # Source files
 MATMUL_SRC = src/rknn_matmul_parallel.c
@@ -32,7 +33,7 @@ BUILD_DIR = build
 LIB_DIR = lib
 MATMUL_LIB = $(LIB_DIR)/librmp.a
 DECODER_LIB = $(LIB_DIR)/libmatmul_decoder.a
-PYTHON_LIB = matmul_decoder.cpython-$(shell $(PYTHON) -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))")
+PYTHON_LIB = matmul_decoder$(shell $(PYTHON) -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))")
 
 .PHONY: all clean matmul decoder python benchmark
 
@@ -77,7 +78,7 @@ $(DECODER_LIB): $(BUILD_DIR)/matmul_decoder.o $(BUILD_DIR)/cpu_ops.o $(BUILD_DIR
 python: $(PYTHON_LIB)
 
 $(PYTHON_LIB): $(PYBIND_SRC) $(DECODER_LIB) $(MATMUL_LIB) | $(BUILD_DIR)
-	$(CXX) $(CXXFLAGS) -I$(PYBIND_INCLUDE) $(INCLUDES) \
+	$(CXX) $(CXXFLAGS) -I$(PYBIND_INCLUDE) -I$(PYTHON_INCLUDE) $(INCLUDES) \
 		-shared -fPIC $< \
 		-L$(LIB_DIR) -lmatmul_decoder -lrmp \
 		$(LDFLAGS) \

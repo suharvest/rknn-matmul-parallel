@@ -3,14 +3,21 @@
  * @brief Implementation of parallel matmul for Rockchip NPU
  *
  * Architecture:
- *   - Parent: coordinates workers via shared memory
- *   - Workers: persistent processes, each holds one NPU matmul context
+ *   - Main thread: coordinates worker threads via shared memory
+ *   - Workers: persistent threads, each holds one NPU matmul context
  *   - Weight splitting: each worker computes N/2 columns
  *
- * Why multi-process:
- *   rknn_matmul_run() has an internal global lock. Even with multiple
- *   contexts in the same process, calls serialize on a single NPU core.
- *   Only separate processes can access different cores concurrently.
+ * Why multi-thread (not multi-process):
+ *   rknn_matmul_run() is synchronous blocking, so single thread cannot
+ *   utilize two NPU cores concurrently. We use pthread to create two
+ *   worker threads that can run in parallel.
+ *
+ *   CRITICAL: Using threads (not fork) allows RKNN model coexistence.
+ *   Fork creates separate processes that each open /dev/rknpu, which
+ *   the driver treats as different "users" and may reject when cores
+ *   are already in use by another RKNN model (e.g., TTS vocoder).
+ *   Threads share the same process and driver fd, so the driver
+ *   allows them to bind different NPU cores without conflict.
  */
 
 #include "rknn_matmul_parallel.h"
@@ -18,15 +25,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
-#include <signal.h>
-#include <sys/ipc.h>
-#include <sys/shm.h>
-#include <sys/wait.h>
 #include <pthread.h>
 #include <time.h>
-
-/* RKNN SDK provides these */
 
 /* ============================================================================
  * Internal structures
@@ -37,7 +37,19 @@ typedef enum {
     CMD_RUN  = 1,
 } WorkerCommand;
 
-/* Shared memory layout for IPC */
+/* Per-worker state */
+typedef struct {
+    int worker_id;
+    int N_half;              /* Columns this worker handles */
+    rknn_matmul_ctx ctx;     /* NPU matmul context */
+    rknn_tensor_mem* mem_A;  /* Input buffer */
+    rknn_tensor_mem* mem_B;  /* Weight buffer */
+    rknn_tensor_mem* mem_C;  /* Output buffer */
+    rknn_matmul_io_attr io_attr;
+    int initialized;
+} WorkerState;
+
+/* Shared control state (accessible by all threads) */
 typedef struct {
     /* Control */
     volatile int command;
@@ -46,35 +58,36 @@ typedef struct {
     int n_workers;
 
     /* Matmul config */
-    int M, K, N_half;
+    int M, K, N, N_half;
     int matmul_type;
     int B_layout;
 
-    /* Data buffers (embedded for simplicity) */
-    int16_t input_buffer[4096];           /* Max M*K = 1*4096 */
-    int16_t output_buffer[RMP_MAX_WORKERS][4096];  /* Max M*N/2 per worker */
-    int input_size;
-
-    /* Worker ID (set before fork so child knows who it is) */
-    int worker_id;
+    /* Data buffers */
+    int16_t* input_buffer;    /* [M * K] */
+    int16_t* output_buffer;   /* [M * N] - workers write to their slice */
+    int16_t* weight_buffers[RMP_MAX_WORKERS];  /* [K * N_half] per worker */
+    size_t input_size;
+    size_t output_size_per_worker;
 
     /* Synchronization */
     pthread_mutex_t mutex;
     pthread_cond_t input_cond;
     pthread_cond_t output_cond;
+
+    /* Worker threads */
+    pthread_t threads[RMP_MAX_WORKERS];
+    WorkerState workers[RMP_MAX_WORKERS];
 } SharedState;
 
 /* Internal context structure */
 struct RmpContext {
     SharedState* shm;
-    int shmid;
-    pid_t worker_pids[RMP_MAX_WORKERS];
     RmpConfig config;
     float last_benchmark_ms;
 };
 
 /* ============================================================================
- * Worker process
+ * Worker thread
  * ============================================================================ */
 
 static rknn_matmul_type to_rknn_type(RmpMatmulType type) {
@@ -85,14 +98,16 @@ static rknn_matmul_type to_rknn_type(RmpMatmulType type) {
     }
 }
 
-static void worker_loop(SharedState* shm, int worker_id) {
+static void* worker_thread_func(void* arg) {
+    SharedState* shm = (SharedState*)arg;
+    int worker_id = shm->workers[shm->worker_id].worker_id;
+    WorkerState* ws = &shm->workers[worker_id];
+
     int M = shm->M;
     int K = shm->K;
-    int N_half = shm->N_half;
+    int N_half = ws->N_half;
 
-    /* Create matmul context AFTER fork (contexts cannot cross process boundary) */
-    rknn_matmul_ctx ctx;
-    rknn_matmul_io_attr io_attr;
+    /* Create matmul context (threads share process, so driver allows this) */
     rknn_matmul_info info = {0};
     info.M = M;
     info.K = K;
@@ -100,21 +115,27 @@ static void worker_loop(SharedState* shm, int worker_id) {
     info.type = shm->matmul_type;
     info.B_layout = shm->B_layout;
 
-    int ret = rknn_matmul_create(&ctx, &info, &io_attr);
+    int ret = rknn_matmul_create(&ws->ctx, &info, &ws->io_attr);
     if (ret != 0) {
         fprintf(stderr, "[worker %d] rknn_matmul_create failed: %d\n", worker_id, ret);
-        return;
+        ws->initialized = 0;
+        return NULL;
     }
+    ws->initialized = 1;
 
     /* Allocate NPU memory buffers */
-    rknn_tensor_mem* mem_A = rknn_create_mem(ctx, io_attr.A.size);
-    rknn_tensor_mem* mem_B = rknn_create_mem(ctx, io_attr.B.size);
-    rknn_tensor_mem* mem_C = rknn_create_mem(ctx, io_attr.C.size);
+    ws->mem_A = rknn_create_mem(ws->ctx, ws->io_attr.A.size);
+    ws->mem_B = rknn_create_mem(ws->ctx, ws->io_attr.B.size);
+    ws->mem_C = rknn_create_mem(ws->ctx, ws->io_attr.C.size);
+
+    /* Copy weight to NPU buffer */
+    memcpy(ws->mem_B->virt_addr, shm->weight_buffers[worker_id],
+           ws->io_attr.B.size);
 
     /* Set I/O bindings */
-    rknn_matmul_set_io_mem(ctx, mem_A, &io_attr.A);
-    rknn_matmul_set_io_mem(ctx, mem_B, &io_attr.B);
-    rknn_matmul_set_io_mem(ctx, mem_C, &io_attr.C);
+    rknn_matmul_set_io_mem(ws->ctx, ws->mem_A, &ws->io_attr.A);
+    rknn_matmul_set_io_mem(ws->ctx, ws->mem_B, &ws->io_attr.B);
+    rknn_matmul_set_io_mem(ws->ctx, ws->mem_C, &ws->io_attr.C);
 
     /* Main loop: wait for input, compute, signal output */
     while (1) {
@@ -127,14 +148,16 @@ static void worker_loop(SharedState* shm, int worker_id) {
 
         if (cmd == CMD_EXIT) break;
 
-        /* Copy input from shared memory to NPU buffer */
-        memcpy(mem_A->virt_addr, shm->input_buffer, shm->input_size);
+        /* Copy input from shared buffer to NPU buffer */
+        memcpy(ws->mem_A->virt_addr, shm->input_buffer, shm->input_size);
 
-        /* Execute matmul on NPU (blocks until complete) */
-        rknn_matmul_run(ctx);
+        /* Execute matmul on NPU (blocks this thread, other thread runs on other core) */
+        rknn_matmul_run(ws->ctx);
 
-        /* Copy output to shared memory */
-        memcpy(shm->output_buffer[worker_id], mem_C->virt_addr, io_attr.C.size);
+        /* Copy output to shared buffer (write to our slice) */
+        int output_offset = worker_id * shm->output_size_per_worker;
+        memcpy(shm->output_buffer + output_offset, ws->mem_C->virt_addr,
+               ws->io_attr.C.size);
 
         /* Signal completion */
         pthread_mutex_lock(&shm->mutex);
@@ -150,10 +173,13 @@ static void worker_loop(SharedState* shm, int worker_id) {
     }
 
     /* Cleanup */
-    rknn_destroy_mem(ctx, mem_A);
-    rknn_destroy_mem(ctx, mem_B);
-    rknn_destroy_mem(ctx, mem_C);
-    rknn_matmul_destroy(ctx);
+    rknn_destroy_mem(ws->ctx, ws->mem_A);
+    rknn_destroy_mem(ws->ctx, ws->mem_B);
+    rknn_destroy_mem(ws->ctx, ws->mem_C);
+    rknn_matmul_destroy(ws->ctx);
+    ws->initialized = 0;
+
+    return NULL;
 }
 
 /* ============================================================================
@@ -176,37 +202,36 @@ RmpContext* rmp_create(const RmpConfig* config, const void* weights, const float
     ctx->config = *config;
     ctx->config.n_workers = n_workers;
 
-    /* Create shared memory */
-    ctx->shmid = shmget(IPC_PRIVATE, sizeof(SharedState), IPC_CREAT | 0600);
-    if (ctx->shmid < 0) {
-        perror("shmget");
+    /* Allocate shared state (threads share same address space, no need for shmget) */
+    SharedState* shm = calloc(1, sizeof(SharedState));
+    if (!shm) {
         free(ctx);
         return NULL;
     }
-    ctx->shm = shmat(ctx->shmid, NULL, 0);
-    if (ctx->shm == (void*)-1) {
-        perror("shmat");
-        shmctl(ctx->shmid, IPC_RMID, NULL);
-        free(ctx);
-        return NULL;
-    }
-    memset(ctx->shm, 0, sizeof(SharedState));
+    ctx->shm = shm;
 
     /* Setup shared config */
     int N_half = config->N / n_workers;
-    ctx->shm->M = config->M;
-    ctx->shm->K = config->K;
-    ctx->shm->N_half = N_half;
-    ctx->shm->matmul_type = to_rknn_type(config->type);
-    ctx->shm->B_layout = config->layout;
-    ctx->shm->n_workers = n_workers;
+    shm->M = config->M;
+    shm->K = config->K;
+    shm->N = config->N;
+    shm->N_half = N_half;
+    shm->matmul_type = to_rknn_type(config->type);
+    shm->B_layout = config->layout;
+    shm->n_workers = n_workers;
 
-    /* Copy weights to shared memory (each worker gets N/2 columns) */
-    size_t weight_half_size = config->K * N_half * sizeof(int16_t);
+    /* Allocate data buffers */
+    shm->input_buffer = malloc(config->M * config->K * sizeof(int16_t));
+    shm->output_buffer = malloc(config->M * config->N * sizeof(int16_t));
+    shm->input_size = config->M * config->K * sizeof(int16_t);
+    shm->output_size_per_worker = config->M * N_half * sizeof(int16_t);
+
+    /* Split weights for each worker */
     for (int i = 0; i < n_workers; i++) {
+        shm->weight_buffers[i] = malloc(config->K * N_half * sizeof(int16_t));
         /* Split weight columns: worker i gets columns [N_half*i : N_half*(i+1)] */
         const int16_t* src = (const int16_t*)weights;
-        int16_t* dst = ctx->shm->output_buffer[i];  /* Temporarily use output buffer */
+        int16_t* dst = shm->weight_buffers[i];
         for (int k = 0; k < config->K; k++) {
             for (int n = 0; n < N_half; n++) {
                 dst[k * N_half + n] = src[k * config->N + N_half * i + n];
@@ -214,39 +239,52 @@ RmpContext* rmp_create(const RmpConfig* config, const void* weights, const float
         }
     }
 
-    /* Initialize process-shared mutex/cond */
-    pthread_mutexattr_t mattr;
-    pthread_condattr_t cattr;
-    pthread_mutexattr_init(&mattr);
-    pthread_mutexattr_setpshared(&mattr, PTHREAD_PROCESS_SHARED);
-    pthread_condattr_init(&cattr);
-    pthread_condattr_setpshared(&cattr, PTHREAD_PROCESS_SHARED);
-    pthread_mutex_init(&ctx->shm->mutex, &mattr);
-    pthread_cond_init(&ctx->shm->input_cond, &cattr);
-    pthread_cond_init(&ctx->shm->output_cond, &cattr);
+    /* Initialize mutex/cond (threads don't need PROCESS_SHARED) */
+    pthread_mutex_init(&shm->mutex, NULL);
+    pthread_cond_init(&shm->input_cond, NULL);
+    pthread_cond_init(&shm->output_cond, NULL);
 
-    /* Fork worker processes */
+    /* Initialize worker states */
     for (int i = 0; i < n_workers; i++) {
-        ctx->shm->worker_id = i;  /* Child reads this to know its ID */
-        pid_t pid = fork();
-        if (pid < 0) {
-            perror("fork");
-            /* Kill existing workers */
-            for (int j = 0; j < i; j++) kill(ctx->worker_pids[j], SIGTERM);
+        shm->workers[i].worker_id = i;
+        shm->workers[i].N_half = N_half;
+        shm->workers[i].initialized = 0;
+    }
+
+    /* Create worker threads */
+    for (int i = 0; i < n_workers; i++) {
+        /* Temporarily set worker_id for thread to read */
+        shm->worker_id = i;
+        int ret = pthread_create(&shm->threads[i], NULL, worker_thread_func, shm);
+        if (ret != 0) {
+            fprintf(stderr, "pthread_create failed for worker %d: %d\n", i, ret);
+            /* Signal existing workers to exit */
+            pthread_mutex_lock(&shm->mutex);
+            shm->command = CMD_EXIT;
+            shm->input_ready = 1;
+            pthread_cond_broadcast(&shm->input_cond);
+            pthread_mutex_unlock(&shm->mutex);
+            /* Wait for existing threads */
+            for (int j = 0; j < i; j++) {
+                pthread_join(shm->threads[j], NULL);
+            }
+            /* Cleanup */
             rmp_destroy(ctx);
             return NULL;
-        } else if (pid == 0) {
-            /* Child process */
-            int my_id = ctx->shm->worker_id;
-            worker_loop(ctx->shm, my_id);
-            _exit(0);
-        } else {
-            ctx->worker_pids[i] = pid;
         }
     }
 
     /* Wait for workers to initialize */
     usleep(100000);  /* 100ms */
+
+    /* Verify all workers initialized */
+    for (int i = 0; i < n_workers; i++) {
+        if (!shm->workers[i].initialized) {
+            fprintf(stderr, "Worker %d failed to initialize\n", i);
+            rmp_destroy(ctx);
+            return NULL;
+        }
+    }
 
     return ctx;
 }
@@ -255,17 +293,14 @@ int rmp_run(RmpContext* ctx, const int16_t* input, int16_t* output) {
     if (!ctx || !input || !output) return -1;
 
     SharedState* shm = ctx->shm;
-    int N_half = ctx->config.N / ctx->config.n_workers;
-    size_t input_size = ctx->config.M * ctx->config.K * sizeof(int16_t);
 
     /* Reset state and copy input */
     pthread_mutex_lock(&shm->mutex);
     shm->input_ready = 0;
-    shm->input_size = input_size;
     for (int i = 0; i < ctx->config.n_workers; i++) {
         shm->outputs_ready[i] = 0;
     }
-    memcpy(shm->input_buffer, input, input_size);
+    memcpy(shm->input_buffer, input, shm->input_size);
 
     /* Signal workers to start */
     shm->command = CMD_RUN;
@@ -285,11 +320,8 @@ int rmp_run(RmpContext* ctx, const int16_t* input, int16_t* output) {
     }
     pthread_mutex_unlock(&shm->mutex);
 
-    /* Gather outputs from all workers */
-    for (int i = 0; i < ctx->config.n_workers; i++) {
-        size_t offset = ctx->config.M * N_half * i;
-        memcpy(output + offset, shm->output_buffer[i], ctx->config.M * N_half * sizeof(int16_t));
-    }
+    /* Copy output from shared buffer */
+    memcpy(output, shm->output_buffer, ctx->config.M * ctx->config.N * sizeof(int16_t));
 
     return 0;
 }
@@ -297,33 +329,37 @@ int rmp_run(RmpContext* ctx, const int16_t* input, int16_t* output) {
 void rmp_destroy(RmpContext* ctx) {
     if (!ctx) return;
 
+    SharedState* shm = ctx->shm;
+    if (!shm) {
+        free(ctx);
+        return;
+    }
+
     /* Signal workers to exit */
-    if (ctx->shm) {
-        pthread_mutex_lock(&ctx->shm->mutex);
-        ctx->shm->command = CMD_EXIT;
-        ctx->shm->input_ready = 1;
-        pthread_cond_broadcast(&ctx->shm->input_cond);
-        pthread_mutex_unlock(&ctx->shm->mutex);
-    }
+    pthread_mutex_lock(&shm->mutex);
+    shm->command = CMD_EXIT;
+    shm->input_ready = 1;
+    pthread_cond_broadcast(&shm->input_cond);
+    pthread_mutex_unlock(&shm->mutex);
 
-    /* Wait for workers */
+    /* Wait for worker threads */
     for (int i = 0; i < ctx->config.n_workers; i++) {
-        if (ctx->worker_pids[i] > 0) {
-            waitpid(ctx->worker_pids[i], NULL, 0);
-        }
+        pthread_join(shm->threads[i], NULL);
     }
 
-    /* Cleanup shared memory */
-    if (ctx->shm) {
-        pthread_mutex_destroy(&ctx->shm->mutex);
-        pthread_cond_destroy(&ctx->shm->input_cond);
-        pthread_cond_destroy(&ctx->shm->output_cond);
-        shmdt(ctx->shm);
-    }
-    if (ctx->shmid >= 0) {
-        shmctl(ctx->shmid, IPC_RMID, NULL);
+    /* Cleanup mutex/cond */
+    pthread_mutex_destroy(&shm->mutex);
+    pthread_cond_destroy(&shm->input_cond);
+    pthread_cond_destroy(&shm->output_cond);
+
+    /* Free buffers */
+    free(shm->input_buffer);
+    free(shm->output_buffer);
+    for (int i = 0; i < ctx->config.n_workers; i++) {
+        free(shm->weight_buffers[i]);
     }
 
+    free(shm);
     free(ctx);
 }
 

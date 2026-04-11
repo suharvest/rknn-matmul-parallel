@@ -46,6 +46,10 @@ typedef struct {
     /* Norm weights (CPU) */
     float* input_norm_w;
     float* post_attn_norm_w;
+
+    /* QK norm weights (optional, [head_dim] each) */
+    float* q_norm_w;
+    float* k_norm_w;
 } LayerMatmulContext;
 
 /**
@@ -311,7 +315,8 @@ static uint8_t* load_uint8_file(const char* path, size_t n_elements) {
 
 static int load_layer_weights(LayerMatmulContext* lc, const char* layer_dir,
                                int hidden_dim, int num_q_heads, int num_kv_heads,
-                               int head_dim, int ffn_dim, QuantizationType quant_type) {
+                               int head_dim, int ffn_dim, QuantizationType quant_type,
+                               int has_qk_norm) {
     char path[512];
     int is_int4 = (quant_type == QUANT_INT4 || quant_type == QUANT_INT4_G128);
 
@@ -334,6 +339,28 @@ static int load_layer_weights(LayerMatmulContext* lc, const char* layer_dir,
     if (!lc->input_norm_w || !lc->post_attn_norm_w) {
         fprintf(stderr, "[MatmulDecoder] Failed to load norm weights from %s\n", layer_dir);
         return -1;
+    }
+
+    /* Load QK norm weights if enabled */
+    if (has_qk_norm) {
+        snprintf(path, sizeof(path), "%s/q_norm.bin", layer_dir);
+        lc->q_norm_w = load_fp32_file(path, head_dim);
+        if (!lc->q_norm_w) {
+            snprintf(path, sizeof(path), "%s/q_norm_weight.bin", layer_dir);
+            lc->q_norm_w = load_fp32_file(path, head_dim);
+        }
+
+        snprintf(path, sizeof(path), "%s/k_norm.bin", layer_dir);
+        lc->k_norm_w = load_fp32_file(path, head_dim);
+        if (!lc->k_norm_w) {
+            snprintf(path, sizeof(path), "%s/k_norm_weight.bin", layer_dir);
+            lc->k_norm_w = load_fp32_file(path, head_dim);
+        }
+
+        if (!lc->q_norm_w || !lc->k_norm_w) {
+            fprintf(stderr, "[MatmulDecoder] Failed to load QK norm weights from %s\n", layer_dir);
+            return -1;
+        }
     }
 
     /* Load projection weights into matmul B memory */
@@ -512,13 +539,13 @@ MatmulDecoderContext* matmul_decoder_create(const char* model_dir,
 
         /* Load weights for this layer */
         snprintf(path, sizeof(path), "%s/layer_%02d", model_dir, i);
-        ret = load_layer_weights(lc, path, hidden_dim, num_q_heads, num_kv_heads, head_dim, ffn_dim, quant_type);
+        ret = load_layer_weights(lc, path, hidden_dim, num_q_heads, num_kv_heads, head_dim, ffn_dim, quant_type, config->has_qk_norm);
         if (ret != 0) {
             fprintf(stderr, "[MatmulDecoder] Failed to load layer %d weights\n", i);
         }
     }
 
-    printf("[MatmulDecoder] Loaded %d layer weights\n", num_layers);
+    printf("[MatmulDecoder] Loaded %d layer weights (qk_norm=%d)\n", num_layers, config->has_qk_norm);
 
     /* KV cache */
     ctx->kv_cache = matmul_kv_cache_create(num_layers, num_kv_heads, head_dim, max_seq_len);
@@ -696,6 +723,18 @@ int matmul_decoder_step(MatmulDecoderContext* ctx,
         run_persistent_matmul(&lc->k_proj, normed, ctx->k_out);
         run_persistent_matmul(&lc->v_proj, normed, ctx->v_out);
 
+        /* QK norm: per-head RMSNorm on Q and K before RoPE */
+        if (ctx->config.has_qk_norm && lc->q_norm_w && lc->k_norm_w) {
+            for (int h = 0; h < num_q_heads; h++) {
+                float* q_head = ctx->q_out + h * head_dim;
+                rms_norm_f32(q_head, q_head, lc->q_norm_w, head_dim, ctx->config.rms_eps);
+            }
+            for (int h = 0; h < num_kv_heads; h++) {
+                float* k_head = ctx->k_out + h * head_dim;
+                rms_norm_f32(k_head, k_head, lc->k_norm_w, head_dim, ctx->config.rms_eps);
+            }
+        }
+
         /* Apply RoPE */
         float* cos = ctx->cos_table + seq_len * (head_dim / 2);
         float* sin = ctx->sin_table + seq_len * (head_dim / 2);
@@ -796,6 +835,8 @@ void matmul_decoder_destroy(MatmulDecoderContext* ctx) {
             destroy_persistent_matmul(&lc->down_proj);
             free(lc->input_norm_w);
             free(lc->post_attn_norm_w);
+            free(lc->q_norm_w);
+            free(lc->k_norm_w);
         }
         free(ctx->layers);
     }
@@ -930,12 +971,17 @@ int matmul_decoder_load_config(const char* json_path, MatmulDecoderConfig* confi
                         config->rms_eps = atof(num_buf);
                     } else if (strncmp(key_start, "rope_theta", key_len) == 0) {
                         config->rope_theta = atof(num_buf);
+                    } else if (strncmp(key_start, "has_qk_norm", key_len) == 0) {
+                        config->has_qk_norm = atoi(num_buf);
                     }
                 }
             } else if (*p == 't' || *p == 'f') {
                 /* Boolean */
                 if (strncmp(key_start, "tie_word_embeddings", key_len) == 0) {
                     config->tie_word_embeddings = (*p == 't');
+                    p += (*p == 't' ? 4 : 5); /* true/false */
+                } else if (strncmp(key_start, "has_qk_norm", key_len) == 0) {
+                    config->has_qk_norm = (*p == 't');
                     p += (*p == 't' ? 4 : 5); /* true/false */
                 }
             }

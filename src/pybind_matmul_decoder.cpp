@@ -170,6 +170,7 @@ public:
             py::arg("rms_eps") = config_.rms_eps,
             py::arg("rope_theta") = config_.rope_theta,
             py::arg("tie_word_embeddings") = config_.tie_word_embeddings,
+            py::arg("has_qk_norm") = config_.has_qk_norm,
             py::arg("exec_mode") = (config_.exec_mode == EXEC_DUAL_CORE) ? "dual_core" : "single_core"
         );
     }
@@ -300,6 +301,7 @@ PYBIND11_MODULE(matmul_decoder, m) {
             py::arg("ffn_dim") = c.ffn_dim,
             py::arg("num_layers") = c.num_layers,
             py::arg("vocab_size") = c.vocab_size,
+            py::arg("has_qk_norm") = c.has_qk_norm,
             py::arg("exec_mode") = "dual_core"
         );
     }, "Default config for Qwen3-0.6B (dual-core)");
@@ -315,6 +317,7 @@ PYBIND11_MODULE(matmul_decoder, m) {
             py::arg("ffn_dim") = c.ffn_dim,
             py::arg("num_layers") = c.num_layers,
             py::arg("vocab_size") = c.vocab_size,
+            py::arg("has_qk_norm") = c.has_qk_norm,
             py::arg("exec_mode") = "single_core"
         );
     }, "Default config for Qwen3-0.6B (single-core)");

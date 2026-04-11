@@ -73,6 +73,9 @@ typedef struct {
     /* Optional: activation type */
     int ffn_act_type;           /* 0=SwiGLU, 1=GeGLU, 2=ReLU */
 
+    /* Optional: QK norm (per-head RMSNorm on Q and K after projection) */
+    int has_qk_norm;            /* 0=disabled, 1=enabled (Qwen3 uses this) */
+
     /* Execution mode */
     ExecutionMode exec_mode;    /* Single or dual NPU core */
 } MatmulDecoderConfig;
@@ -86,7 +89,7 @@ static inline MatmulDecoderConfig matmul_decoder_config_qwen3_0_6b(void) {
         .hidden_dim = 1024,
         .num_q_heads = 16,
         .num_kv_heads = 8,
-        .head_dim = 64,
+        .head_dim = 128,
         .ffn_dim = 3072,
         .num_layers = 28,
         .vocab_size = 151936,
@@ -98,6 +101,7 @@ static inline MatmulDecoderConfig matmul_decoder_config_qwen3_0_6b(void) {
         .rope_scaling_type = 0,
         .norm_type = 0,  /* RMSNorm */
         .ffn_act_type = 0, /* SwiGLU */
+        .has_qk_norm = 1,  /* Qwen3 uses per-head QK norm */
         .exec_mode = EXEC_DUAL_CORE,  /* Use dual NPU core by default */
     };
 }
@@ -152,6 +156,10 @@ typedef struct {
     /* Normalization */
     float* input_norm_weight;   /* [hidden_dim] */
     float* post_attn_norm_weight; /* [hidden_dim] */
+
+    /* QK norm (optional, only if has_qk_norm=1) */
+    float* q_norm_weight;       /* [head_dim] */
+    float* k_norm_weight;       /* [head_dim] */
 } LayerWeights;
 
 /* ─── KV Cache ─── */
