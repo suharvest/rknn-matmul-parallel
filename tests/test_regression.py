@@ -89,30 +89,14 @@ def main():
     )
     print()
 
-    # Run one step
+    # Run one step — step() returns logits array, step_get_token() returns int
     print("Running step with token_id=%d..." % token_id)
-    emb_path = os.path.join(args.model_dir, "embeddings.npy")
-    if os.path.exists(emb_path):
-        emb = np.load(emb_path)
-    else:
-        with open(os.path.join(args.model_dir, "config.json")) as f:
-            mcfg = json.load(f)
-        emb = np.fromfile(os.path.join(args.model_dir, "embeddings.bin"),
-                          dtype=np.float32).reshape(-1, mcfg["hidden_dim"])
-
-    x = emb[token_id].astype(np.float32)
-    result = decoder.step(token_id=token_id)
-    logits = decoder.get_logits()  # try to get logits if available
-
-    # If get_logits not available, use step return
-    if logits is None:
-        print("WARNING: get_logits() not available, using predicted token only")
-        predicted = result
-        logits_available = False
-    else:
-        logits_available = True
-        predicted = np.argmax(logits)
+    decoder.clear_kv_cache()
+    logits = np.array(decoder.step(token_id=token_id))  # [vocab_size]
+    predicted = int(np.argmax(logits))
+    logits_available = True
     print(f"Predicted token: {predicted}")
+    print(f"Logits: std={logits.std():.4f}, min={logits.min():.4f}, max={logits.max():.4f}")
     print()
 
     # === Checks ===
