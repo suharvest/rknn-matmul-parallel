@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  <strong>Open-source RKLLM alternative — ~16ms/token with full transparency.</strong>
+  <strong>Open-source transformer decoder for Rockchip NPU — replace RKLLM with full transparency.</strong>
 </p>
 
 <p align="center">
@@ -14,324 +14,287 @@
   <a href="https://github.com/airockchip/rknn-llm"><img src="https://img.shields.io/badge/Compared%20to-RKLLM-green" alt="RKLLM Alternative"></a>
 </p>
 
-Run transformer decoders on Rockchip NPU with performance matching RKLLM, but fully open-source and conflict-free with RKNN models.
+Run transformer decoders on Rockchip NPU with full source code, conflict-free RKNN coexistence, and per-step profiling.
 
 ## Why This Exists
 
-Rockchip's RKLLM achieves ~16ms/token on Qwen3-ASR-0.6B, but:
+Rockchip's RKLLM is fast but closed-source, and **conflicts with RKNN models** when running ASR + TTS simultaneously:
 
 | Aspect | RKLLM | This Project |
 |--------|-------|--------------|
-| **Performance** | ~16 ms/token | ~16 ms/token |
-| **Open source** | ❌ Closed `librkllmrt.so` | ✅ Full code |
-| **RKNN coexistence** | ❌ Conflicts with RKNN models | ✅ IOMMU domain isolation |
-| **Handle scalability** | ❌ Opaque resource limits | ✅ Context pooling (~211 handles for 28 layers) |
+| **Performance** | 43 ms/token | 82 ms/token (1.9×) |
+| **Open source** | ❌ Closed `librkllmrt.so` | ✅ Full C code |
+| **RKNN coexistence** | ❌ IOMMU domain conflict | ✅ Domain isolation |
 | **Custom ops** | ❌ Black box | ✅ Full control |
-| **Debuggability** | ❌ Opaque | ✅ Transparent |
+| **Profiling** | ❌ No visibility | ✅ Per-component timing |
+| **Debuggability** | ❌ Opaque | ✅ Regression test suite |
 
-**RKLLM has known conflicts when running alongside RKNN models** (e.g., TTS vocoder, ASR encoder). Root causes:
-1. **IOMMU domain contention** — RKLLM and RKNN share domain 0's 4GB address space; overflow causes 6s timeout + EINVAL
-2. **NPU handle limit** — `/dev/rknpu` caps at ~1020 DMA handles per process; a 28-layer decoder naively creates 784
+**Root causes RKLLM conflicts:**
+1. **IOMMU domain contention** — RKLLM and RKNN share domain 0's 4GB address space
+2. **NPU handle limit** — `/dev/rknpu` caps at ~1020 DMA handles per process
 
-This library solves both: IOMMU domain isolation (`iommu_domain_id=1`) and context pooling (5 shared contexts instead of 196).
+This library solves both: `iommu_domain_id=1` for isolation, context pooling for handle efficiency.
 
 ## Performance
 
-| Implementation | ms/token | Notes |
-|----------------|----------|-------|
-| **This project (dual-core)** | **~16** | Open source, W4A16 quantization |
-| RKLLM (official) | ~16 | Closed runtime |
-| Matmul single-core | ~27 | Baseline |
+### Measured on RK3576 (Qwen3-ASR-0.6B, 28 layers, d=1024)
 
-*Measured on RK3576 with Qwen3-ASR-0.6B decoder (28 layers, d=1024).*
+| Configuration | ms/token | Breakdown |
+|---------------|----------|-----------|
+| **INT4 + NPU lm_head** | **82** | matmul 34 + rebind 24 + lm_head 19 + cpu 4 |
+| FP16 + NPU lm_head | 252 | matmul 88 + rebind 90 + lm_head 69 + cpu 4 |
+| FP16 + CPU lm_head | 280 | matmul 85 + rebind 69 + lm_head 103 + cpu 3 |
+| FP16 naive (v1) | 461 | no NEON, no NPU lm_head |
+| RKLLM W4A16 (closed) | 43 | compiled NPU graph |
 
-### Single Matmul Operation
+### Optimization Journey (461ms → 82ms)
 
-| Dimensions | Single-core | Dual-core | Speedup |
-|------------|-------------|-----------|---------|
-| 1×1024×1024 | 0.64 ms | 0.47 ms | **1.37×** |
-| 1×1024×3072 | 1.79 ms | 1.31 ms | **1.37×** |
+| Optimization | ms/token | Improvement |
+|-------------|----------|-------------|
+| Baseline (naive CPU lm_head) | 461 | — |
+| + NEON GEMV | 335 | -27% |
+| + Destroy fix + stable pool | 280 | -16% |
+| + W4A16 quantization | 167 | -40% |
+| + NPU tiled lm_head (FP16) | 125 | -25% |
+| + NPU lm_head INT4 | **82** | **-34%** |
+
+### Why 82ms vs RKLLM 43ms?
+
+RKLLM compiles the entire 28-layer transformer into **one fused NPU graph** with SRAM caching. Our library uses the matmul API with per-operation dispatch:
+- 196 individual `rknn_matmul_run` calls (vs 1 fused graph)
+- CPU-side attention, RoPE, RMSNorm (vs fused NPU ops)
+- B weight rebinding overhead (vs pre-loaded weights)
+
+The 1.9× gap is architectural, not algorithmic.
+
+### Per-Component Profile (INT4, last step)
+
+```
+total:    82.0 ms
+├─ matmul (NPU):  34.4 ms  (42%)  ← 28 layers × 7 INT4 projections
+├─ rebind:        23.6 ms  (29%)  ← 234 rknn_matmul_set_io_mem calls
+├─ lm_head (NPU): 18.7 ms  (23%)  ← 38 tiles × (1024,4096) INT4
+├─ cpu_ops:        4.0 ms  ( 5%)  ← RMSNorm + RoPE + attention + SiLU
+└─ convert:        1.1 ms  ( 1%)  ← FP16↔FP32
+```
 
 ## Features
 
-- **Dual NPU core parallelism** via fork + persistent worker processes
 - **IOMMU domain isolation** — runs on separate domain from RKNN models, zero conflict
-- **Configurable context strategy** — pool (saves handles) or dedicated (fastest, no rebind overhead)
-- **Complete decoder stack**: KV cache, RoPE, RMSNorm, attention, FFN, sampling
+- **Context pooling** — 28-layer decoder uses only ~211 NPU handles (vs 784 naive)
+- **NPU-tiled lm_head** — 151936-vocab projection on NPU via INT4 tiles (103ms → 19ms)
+- **Per-step profiling** — `decoder.stats` returns matmul_ms, rebind_ms, lm_head_ms, cpu_ops_ms
+- **Complete decoder stack**: KV cache, RoPE (interleaved + split-half), RMSNorm, GQA attention, FFN, sampling
 - **Multi lm_head support**: multiple output heads per step (e.g., Code Predictor with 15 heads)
-- **Python bindings**: `pip install` and use like RKLLM
-- **Model-agnostic config**: adapt to any decoder-only transformer
-- **INT4/INT8/FP16 quantization** support
-- **NEON-optimized CPU operators**
+- **W4A16 per-column quantization** with NEON-fused scale application
+- **NEON-optimized CPU operators** and FP16 GEMV
+- **Python bindings** via pybind11
+- **Regression test suite** with numpy reference (cosine=0.999999)
+
+## Real-World Usage
+
+### Qwen3-ASR — 52-language streaming ASR
+
+```
+Encoder:  RKNN FP16 merged      → 431ms / 4s chunk
+Decoder:  This library (INT4)   → 82ms/token, 28 layers
+LM head:  NPU INT4 tiled        → 19ms (151936 vocab)
+End-to-end RTF: ~0.5
+```
+
+### Qwen3-TTS Code Predictor — Autoregressive codec generation
+
+```
+Decoder:  This library (W4A16)  → 5 layers, 15 autoregressive steps
+LM heads: 15 × vocab=2048       → matmul_decoder_step_head()
+Per-step: ~6ms
+```
+
+### Matcha-TTS — Non-autoregressive acoustic model
+
+```
+Matcha:   RKNN FP16             → 470ms
+Vocos:    RKNN FP16             → 250ms
+ISTFT:    CPU                   → 190ms
+Total:    1.76s, RTF 0.054
+```
+
+*Matcha and Vocos run as RKNN models on domain 0, this library's decoder runs on domain 1 — no conflict.*
 
 ## Quick Start
 
-### Python (Recommended)
+### Python
 
 ```python
-from matmul_decoder import MatmulDecoder
+import matmul_decoder as md
+import numpy as np
 
-# Create decoder with model weights
-decoder = MatmulDecoder(
-    model_path="/path/to/qwen3-asr-weights",
-    exec_mode="dual_core"
+# Create decoder (auto-selects pool mode and NPU lm_head)
+decoder = md.MatmulDecoder(
+    model_dir="/path/to/weights",
+    max_seq_len=4096,
+    quant_type="int4",       # "fp16" or "int4"
+    exec_mode="single_core"  # "single_core" or "dual_core"
 )
 
-# Run inference
-result = decoder.run_embed(embeddings, n_tokens=10)
-print(result["text"])
+# Run one step
+logits = decoder.step(token_id=151644)  # returns numpy array [vocab_size]
+predicted = np.argmax(logits)
+
+# Per-step profiling
+stats = decoder.stats
+print(f"total={stats['total_ms']:.1f}ms, matmul={stats['matmul_ms']:.1f}ms, "
+      f"lm_head={stats['lm_head_ms']:.1f}ms")
 ```
 
 ### C API
 
 ```c
-#include <rknn_matmul_parallel.h>
+#include "matmul_decoder.h"
 
-int main() {
-    RmpConfig config = {
-        .M = 1, .K = 1024, .N = 1024,
-        .type = RMP_TYPE_FP16_FP16,
-        .n_workers = 2,
-    };
+MatmulDecoderConfig config = matmul_decoder_config_qwen3_0_6b();
+MatmulDecoderContext* ctx = matmul_decoder_create(
+    "/path/to/weights", &config, QUANT_INT4, 4096);
 
-    RmpContext* ctx = rmp_create(&config, weights, NULL);
-    rmp_run(ctx, input, output);
-    rmp_destroy(ctx);
-}
+float logits[151936];
+int token = matmul_decoder_step(ctx, 151644, NULL, logits);
+
+MatmulDecoderStats stats;
+matmul_decoder_get_stats(ctx, &stats);
+printf("total=%.1fms matmul=%.1fms lm_head=%.1fms\n",
+       stats.total_ms, stats.matmul_ms, stats.lm_head_ms);
+
+matmul_decoder_destroy(ctx);
 ```
 
 ## Installation
 
-### Prerequisites
-
-- RKNN SDK (RKNPU2 runtime)
-- CMake or Make
-- Python 3.9+ (for Python bindings)
-
-### Build from Source
-
 ```bash
-# Set RKNN SDK path
+# Prerequisites: RKNN SDK (RKNPU2 runtime), GCC, Python 3.9+
+
 export RKNN_SDK_PATH=/path/to/rknn-toolkit2/rknpu2/runtime/Linux
-
-# Build C library
-make
-
-# Build Python bindings
-cd python && pip install .
+make python  # builds C library + Python binding
 ```
-
-## Architecture
-
-```
-┌─────────────────────────────────────────────┐
-│  matmul_decoder.py (Python wrapper)         │  ← User API
-├─────────────────────────────────────────────┤
-│  pybind_matmul_decoder.cpp                  │  ← Python binding
-├─────────────────────────────────────────────┤
-│  matmul_decoder.c (Complete decoder)        │
-│    ├─ KV cache management                   │
-│    ├─ CPU ops (RoPE/RMSNorm/attention)      │
-│    ├─ Sampling (top-k/top-p/greedy)         │
-│    └─ rmp_run() (parallel matmul)           │
-├─────────────────────────────────────────────┤
-│  rknn_matmul_parallel.c (Core library)      │
-│    ├─ Fork + persistent workers             │
-│    ├─ Shared memory IPC                     │
-│    └─ Weight splitting (N/2 per worker)     │
-└─────────────────────────────────────────────┘
-```
-
-**How dual-core parallelism works:**
-
-```
-Parent Process
-    │
-    │  input (M × K)
-    ▼
-┌─────────────────┐
-│  Shared Memory  │
-└────────┬────────┘
-         │
-    ┌────┴────┐
-    ▼         ▼
-┌───────┐ ┌───────┐
-│Worker │ │Worker │
-│ NPU#0 │ │ NPU#1 │
-│ N/2   │ │ N/2   │
-│ cols  │ │ cols  │
-└───┬───┘ └───┬───┘
-    │         │
-    └────┬────┘
-         ▼
-    output (M × N)
-```
-
-Workers split the weight matrix columns, compute independently on separate NPU cores, then outputs are gathered.
-
-## Real-World Usage
-
-This library powers real-world speech AI on RK3576:
-
-**ASR Decoder** — [qwen3asr_rk](https://github.com/qzxyz/qwen3asr_rk), 52-language streaming ASR
-> - Encoder: RKNN FP16 merged model (431ms/4s chunk)
-> - **Decoder: This matmul library (~16ms/token, 28 layers, single lm_head)**
-> - End-to-end RTF: 0.44
-
-**TTS Code Predictor** — Qwen3-TTS autoregressive codec generation
-> - 5-layer transformer, 15 autoregressive steps
-> - **15 different lm_heads, one per step (vocab=2048 each)**
-> - Uses `matmul_decoder_step_head()` to select lm_head per step
 
 ## Model Adaptation
 
 This is a **model-agnostic** decoder. To adapt a new model:
 
-1. Export weights in required format:
+1. Export weights:
    ```
    model_dir/
-   ├── config.json           # Model configuration
-   ├── embeddings.bin        # [vocab_size, hidden_dim] FP32
-   ├── lm_head.bin           # [vocab_size, hidden_dim] (or lm_head_00..14.bin for multi-head)
+   ├── config.json
+   ├── embeddings.bin          # [vocab_size, hidden_dim] FP32
+   ├── final_norm.bin          # [hidden_dim] FP32
    └── layers/
        ├── layer_00/
-       │   ├── q_proj.bin    # FP16 weights
+       │   ├── q_proj.bin      # FP16 (or q_proj_weight.bin + q_proj_scales.bin for INT4)
        │   ├── k_proj.bin
-       │   └── ...
+       │   ├── v_proj.bin
+       │   ├── o_proj.bin
+       │   ├── gate_proj.bin
+       │   ├── up_proj.bin
+       │   ├── down_proj.bin
+       │   ├── input_norm.bin  # FP32
+       │   ├── post_attn_norm.bin
+       │   ├── q_norm.bin      # Optional (QK norm)
+       │   └── k_norm.bin
        └── ...
    ```
 
-2. Create config for your model:
-
-   **Standard LLM decoder** (single lm_head):
+2. Create config:
    ```c
    MatmulDecoderConfig config = {
        .hidden_dim = 1024, .num_layers = 28,
        .num_q_heads = 16, .num_kv_heads = 8, .head_dim = 128,
        .ffn_dim = 3072, .vocab_size = 151936,
+       .rope_theta = 1000000.0f,
+       .has_qk_norm = 1,
+       .rope_style = 0,           // 0=interleaved (Qwen/LLaMA), 1=split-half (GPT-NeoX)
+       .iommu_domain_id = 1,      // Separate from RKNN models
+       .context_pool_mode = 0,    // Auto
    };
    ```
-
-   **Multi-head decoder** (e.g., TTS Code Predictor):
-   ```c
-   MatmulDecoderConfig config = {
-       .hidden_dim = 1024, .num_layers = 5,
-       .num_q_heads = 16, .num_kv_heads = 8, .head_dim = 128,
-       .ffn_dim = 3072, .vocab_size = 2048,
-       .num_lm_heads = 15,          /* 15 different output heads */
-       .lm_head_vocab_size = 2048,  /* each head outputs 2048 logits */
-   };
-   // Use matmul_decoder_step_head(ctx, -1, embed, step_idx, logits)
-   ```
-
-3. (Optional) Write export script for your model format
-
-See `examples/export_qwen3_asr.py` for reference.
 
 ## Configuration Guide
 
 ### Context Pool Mode
 
-The `context_pool_mode` setting controls how NPU matmul contexts are managed. This is the most impactful performance/compatibility tradeoff:
-
 | Mode | Value | NPU Handles | B Rebind | Best For |
 |------|-------|-------------|----------|----------|
-| **Auto** | `0` | adaptive | adaptive | Default — picks the best option automatically |
-| **Pool** | `1` | ~211 (28L) | Yes (~250ms) | Running alongside RKNN models (handle budget tight) |
-| **Dedicated** | `2` | ~784 (28L) | **No** | Standalone (fastest, no RKNN coexistence needed) |
-
-```c
-MatmulDecoderConfig config = matmul_decoder_config_qwen3_0_6b();
-
-// Auto (default): dedicated if handles fit, pool otherwise
-config.context_pool_mode = 0;
-
-// Force pool: when running alongside RKNN encoder/vocoder
-config.context_pool_mode = 1;
-
-// Force dedicated: maximum speed, no other RKNN models loaded
-config.context_pool_mode = 2;
-```
-
-**Why it matters:** Profile showed B rebind (`rknn_matmul_set_io_mem`) triggers an IOMMU page table update per call. With 196 calls/token (28 layers × 7 projections), this adds ~250ms — 56% of total latency. Dedicated mode eliminates this entirely.
+| **Auto** | `0` | adaptive | adaptive | Default — pools for ≥16 layers |
+| **Pool** | `1` | ~211 (28L) | Yes | Running alongside RKNN models |
+| **Dedicated** | `2` | ~784 (28L) | **No** | Small models (≤16 layers) |
 
 ### Quantization
 
-| Type | Weight Size | Accuracy | Speed |
-|------|------------|----------|-------|
-| FP16 | 100% | Best | Baseline |
-| W4A16 | 25% | Good (cosine >0.997) | ~1.5x faster |
-| W8A16 | 50% | Better | ~1.2x faster |
+| Type | Weight Size | Speed | Accuracy |
+|------|------------|-------|----------|
+| FP16 | 100% | 252 ms/token | Best (cosine=1.0) |
+| **W4A16** | **25%** | **82 ms/token** | Good (cosine>0.998) |
 
-W4A16 uses per-column INT4 quantization with FP32 scales applied on CPU after NPU matmul.
+### RoPE Style
 
-## Testing
+| Style | Value | Models |
+|-------|-------|--------|
+| Interleaved | `0` | Qwen3, LLaMA, Mistral (default) |
+| Split-half | `1` | GPT-NeoX, ChatGLM |
+
+## Testing & Benchmarking
 
 ```bash
-# Generate numpy reference (one-time)
+# Generate numpy reference (one-time, runs on device)
 python3 tests/generate_reference.py --model-dir /path/to/weights
 
-# Regression test (after code changes)
+# Regression test (verifies correctness after code changes)
 python3 tests/test_regression.py --model-dir /path/to/weights
+# Output: cosine similarity, top-1 match, top-5 overlap
 
 # Performance benchmark
-python3 tests/benchmark.py --model-dir /path/to/weights --modes single_core
-python3 tests/benchmark.py --model-dir /path/to/w4a16_weights --quant-type int4
+python3 tests/benchmark.py --model-dir /path/to/weights --quant-type int4
+# Output: ms/token table with load time, avg, p50, p99
 ```
 
-## API Reference
+## Architecture
 
-### C API
-
-| Function | Description |
-|----------|-------------|
-| `rmp_create(config, weights, scales)` | Create context, fork workers |
-| `rmp_run(ctx, input, output)` | Execute parallel matmul |
-| `rmp_destroy(ctx)` | Cleanup workers |
-| `rmp_benchmark(ctx, n_runs)` | Measure performance |
-| `matmul_decoder_create(dir, config, ...)` | Create decoder from weights directory |
-| `matmul_decoder_step(ctx, token, embed, logits)` | Run one decode step (single lm_head) |
-| `matmul_decoder_step_head(ctx, token, embed, idx, logits)` | Run one step with specific lm_head |
-| `matmul_decoder_destroy(ctx)` | Free decoder resources |
-
-### Python API
-
-| Class/Method | Description |
-|--------------|-------------|
-| `MatmulDecoder(model_path, exec_mode)` | Create decoder instance |
-| `decoder.run_embed(embeddings, n_tokens)` | Run inference with embeddings |
-| `decoder.clear_kv_cache()` | Clear KV cache |
-| `decoder.release()` | Release resources |
+```
+┌─────────────────────────────────────────────────┐
+│  Python: matmul_decoder.step(token_id)          │
+├─────────────────────────────────────────────────┤
+│  pybind11 C++ wrapper                           │
+├─────────────────────────────────────────────────┤
+│  matmul_decoder.c                               │
+│    ├─ Context pool (5 shared NPU contexts)      │
+│    ├─ Per-layer: rebind B → matmul_run (NPU)    │
+│    ├─ CPU ops: RMSNorm, RoPE, GQA attention     │
+│    ├─ NPU tiled lm_head (38 × INT4 tiles)       │
+│    └─ Per-step profiling (clock_gettime)        │
+├─────────────────────────────────────────────────┤
+│  RKNN Matmul API (librknnrt.so)                 │
+│    ├─ rknn_matmul_create / run / destroy        │
+│    ├─ IOMMU domain isolation                    │
+│    └─ FP16×FP16→FP32 / FP16×INT4→FP16          │
+└─────────────────────────────────────────────────┘
+```
 
 ## Supported Platforms
 
-| SoC | NPU Cores | Status |
-|-----|-----------|--------|
-| RK3576 | 2 | Tested |
-| RK3588/RK3588S | 2 | Compatible |
+| SoC | NPU Cores | Status | Notes |
+|-----|-----------|--------|-------|
+| RK3576 | 2 | Tested (82ms/token) | Primary development platform |
+| RK3588 | 3 | Compatible | Expected faster (more NPU cores) |
 
-## Why Not Just Use RKLLM?
+## Known Limitations
 
-See the [comparison table above](#why-this-exists) for a detailed breakdown.
-
-**TL;DR:** This library matches RKLLM's ~16ms/token performance while being fully open-source and conflict-free with RKNN models.
-
-## Contributing
-
-Contributions welcome! Areas of interest:
-
-- **New model support**: Export scripts for Llama, Mistral, Phi, etc.
-- **CPU op optimizations**: SIMD optimizations for other ARM variants
-- **Documentation**: Tutorials, integration guides
-- **Testing**: More model/SoC combinations
-
-Please open an issue or PR on GitHub.
+- **B rebind overhead**: Context pooling requires rebinding B weights per matmul (24ms/token for 28 layers). This is an RKNN matmul API limitation.
+- **IOMMU memory budget**: ~211 DMA handles for 28 layers + 38 lm_head tiles. QKV merge (combining 3 projections into 1) exceeds budget on 8GB devices.
+- **INT4 lm_head precision**: Per-column INT4 quantization of the 151936-vocab projection causes minor rank changes in top-1 predictions (cosine>0.998, top-5 overlap maintained).
 
 ## License
 
-MIT License. Use freely for any purpose.
+MIT License.
 
 ## Acknowledgments
 
 - Inspired by [qwen3asr_rk](https://github.com/qzxyz/qwen3asr_rk) for ASR decoder integration
-- Architecture informed by Rockchip's [rknn-llm](https://github.com/airockchip/rknn-llm) documentation
+- Architecture informed by Rockchip's [rknn-llm](https://github.com/airockchip/rknn-llm)
