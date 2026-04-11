@@ -345,8 +345,11 @@ const MatmulDecoderConfig* matmul_decoder_get_config(const MatmulDecoderContext*
  */
 typedef struct {
     float total_ms;
-    float matmul_ms;
-    float cpu_ops_ms;
+    float matmul_ms;        /* NPU matmul_run time */
+    float rebind_ms;        /* B rebind (rknn_matmul_set_io_mem) time */
+    float convert_ms;       /* FP16↔FP32 conversion time */
+    float cpu_ops_ms;       /* RMSNorm + RoPE + attention + SiLU */
+    float lm_head_ms;       /* LM head GEMV time */
     int n_steps;
 } MatmulDecoderStats;
 

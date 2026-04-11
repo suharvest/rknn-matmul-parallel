@@ -183,7 +183,10 @@ public:
         return py::dict(
             py::arg("total_ms") = stats.total_ms,
             py::arg("matmul_ms") = stats.matmul_ms,
+            py::arg("rebind_ms") = stats.rebind_ms,
+            py::arg("convert_ms") = stats.convert_ms,
             py::arg("cpu_ops_ms") = stats.cpu_ops_ms,
+            py::arg("lm_head_ms") = stats.lm_head_ms,
             py::arg("n_steps") = stats.n_steps
         );
     }

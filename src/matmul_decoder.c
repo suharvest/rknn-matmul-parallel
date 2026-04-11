@@ -12,7 +12,15 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <time.h>
 #include <arm_neon.h>
+
+/* Timing helper */
+static inline double now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
+}
 #include <sys/stat.h>
 
 /* ─── Internal Structures ─── */
@@ -90,7 +98,8 @@ struct MatmulDecoderContext {
     float* embeddings;          /* [vocab_size, hidden_dim] */
 
     /* LM head(s) */
-    float* lm_head;             /* Single lm_head: [vocab_size, hidden_dim] */
+    float* lm_head;             /* Single lm_head: [vocab_size, hidden_dim] FP32 */
+    int16_t* lm_head_fp16;      /* FP16 copy for fast GEMV (halves bandwidth) */
     float** lm_heads;           /* Multi lm_head: [num_lm_heads][lm_head_vocab_size * hidden_dim] */
     int num_lm_heads;           /* 0 = single head mode */
 
@@ -321,29 +330,40 @@ static void destroy_pool(MatmulPoolEntry* pool, int n_pool) {
     }
 }
 
+/* Per-step timing accumulators (reset at start of each step) */
+static double _acc_rebind_ms = 0;
+static double _acc_matmul_ms = 0;
+static double _acc_convert_ms = 0;
+
 static int run_persistent_matmul(PersistentMatmul* pm, const float* input_fp32, float* output_fp32) {
     int K = pm->K, N = pm->N;
+    double t0, t1;
 
-    /* Pooled mode: rebind B weight before each run (~10μs ioctl) */
+    /* Pooled mode: rebind B weight before each run */
     if (pm->is_pooled) {
+        t0 = now_ms();
         rknn_matmul_set_io_mem(pm->ctx, pm->mem_B, &pm->io.B);
+        _acc_rebind_ms += now_ms() - t0;
     }
 
     /* Convert input to FP16 */
+    t0 = now_ms();
     vec_fp32_to_fp16((int16_t*)pm->mem_A->virt_addr, input_fp32, K);
+    _acc_convert_ms += now_ms() - t0;
 
     /* Run matmul */
+    t0 = now_ms();
     int ret = rknn_matmul_run(pm->ctx);
+    _acc_matmul_ms += now_ms() - t0;
     if (ret != 0) {
         return MATMUL_DECODER_ERR_RKNN;
     }
 
     /* Read output and apply per-column scales if W4A16 */
+    t0 = now_ms();
     if (pm->output_is_fp32) {
-        /* FLOAT16_TO_FLOAT32: C is already FP32 */
         memcpy(output_fp32, pm->mem_C->virt_addr, N * sizeof(float));
     } else if (pm->col_scales) {
-        /* INT4_TO_FLOAT16: convert FP16→FP32 and multiply per-column scales (NEON) */
         const int16_t* src = (const int16_t*)pm->mem_C->virt_addr;
         const float* scales = pm->col_scales;
         int i;
@@ -357,9 +377,9 @@ static int run_persistent_matmul(PersistentMatmul* pm, const float* input_fp32, 
             output_fp32[i] = (float)(*(const __fp16*)(src + i)) * scales[i];
         }
     } else {
-        /* FP16 output without scales */
         vec_fp16_to_fp32(output_fp32, (int16_t*)pm->mem_C->virt_addr, N);
     }
+    _acc_convert_ms += now_ms() - t0;
 
     return MATMUL_DECODER_OK;
 }
@@ -481,6 +501,56 @@ static void gemv_f32_neon(float* out, const float* x, const float* W, int N, int
         }
         float s = vaddvq_f32(acc);
         for (; h < K; h++) s += x[h] * w[h];
+        out[v] = s;
+    }
+}
+
+/**
+ * GEMV with FP16 weight matrix — halves memory bandwidth vs FP32.
+ * x: [K] FP32, W: [N, K] FP16 (row-major), out: [N] FP32.
+ */
+static void gemv_f16_neon(float* out, const float* x, const int16_t* W_fp16, int N, int K) {
+    int v = 0;
+
+    for (; v <= N - 4; v += 4) {
+        float32x4_t acc0 = vdupq_n_f32(0.0f);
+        float32x4_t acc1 = vdupq_n_f32(0.0f);
+        float32x4_t acc2 = vdupq_n_f32(0.0f);
+        float32x4_t acc3 = vdupq_n_f32(0.0f);
+
+        const __fp16* w0 = (const __fp16*)(W_fp16 + (v + 0) * K);
+        const __fp16* w1 = (const __fp16*)(W_fp16 + (v + 1) * K);
+        const __fp16* w2 = (const __fp16*)(W_fp16 + (v + 2) * K);
+        const __fp16* w3 = (const __fp16*)(W_fp16 + (v + 3) * K);
+
+        int h = 0;
+        for (; h <= K - 4; h += 4) {
+            float32x4_t xv = vld1q_f32(x + h);
+            acc0 = vfmaq_f32(acc0, xv, vcvt_f32_f16(vld1_f16(w0 + h)));
+            acc1 = vfmaq_f32(acc1, xv, vcvt_f32_f16(vld1_f16(w1 + h)));
+            acc2 = vfmaq_f32(acc2, xv, vcvt_f32_f16(vld1_f16(w2 + h)));
+            acc3 = vfmaq_f32(acc3, xv, vcvt_f32_f16(vld1_f16(w3 + h)));
+        }
+
+        float s0 = vaddvq_f32(acc0), s1 = vaddvq_f32(acc1);
+        float s2 = vaddvq_f32(acc2), s3 = vaddvq_f32(acc3);
+        for (; h < K; h++) {
+            float xh = x[h];
+            s0 += xh * (float)w0[h]; s1 += xh * (float)w1[h];
+            s2 += xh * (float)w2[h]; s3 += xh * (float)w3[h];
+        }
+        out[v] = s0; out[v+1] = s1; out[v+2] = s2; out[v+3] = s3;
+    }
+
+    for (; v < N; v++) {
+        float32x4_t acc = vdupq_n_f32(0.0f);
+        const __fp16* w = (const __fp16*)(W_fp16 + v * K);
+        int h = 0;
+        for (; h <= K - 4; h += 4) {
+            acc = vfmaq_f32(acc, vld1q_f32(x + h), vcvt_f32_f16(vld1_f16(w + h)));
+        }
+        float s = vaddvq_f32(acc);
+        for (; h < K; h++) s += x[h] * (float)w[h];
         out[v] = s;
     }
 }
@@ -784,6 +854,17 @@ MatmulDecoderContext* matmul_decoder_create(const char* model_dir,
         }
     }
 
+    /* Create FP16 copy of lm_head for fast GEMV (halves memory bandwidth) */
+    if (ctx->lm_head && n_lm <= 1) {
+        size_t lm_size = (size_t)vocab_size * hidden_dim;
+        ctx->lm_head_fp16 = malloc(lm_size * sizeof(int16_t));
+        if (ctx->lm_head_fp16) {
+            vec_fp32_to_fp16(ctx->lm_head_fp16, ctx->lm_head, lm_size);
+            printf("[MatmulDecoder] Created FP16 lm_head for fast GEMV (%zuMB → %zuMB)\n",
+                   lm_size * 4 / (1024*1024), lm_size * 2 / (1024*1024));
+        }
+    }
+
     /* Allocate layer contexts */
     ctx->layers = calloc(num_layers, sizeof(LayerMatmulContext));
     if (!ctx->layers) {
@@ -1071,6 +1152,10 @@ int matmul_decoder_step(MatmulDecoderContext* ctx,
                         int token_id,
                         const float* embedding,
                         float* output_logits) {
+    double _step_t0 = now_ms(), _cpu_t0;
+    _acc_rebind_ms = _acc_matmul_ms = _acc_convert_ms = 0;
+    double _cpu_ops_ms = 0, _lm_head_ms = 0;
+
     int hidden_dim = ctx->config.hidden_dim;
     int num_layers = ctx->config.num_layers;
     int num_q_heads = ctx->config.num_q_heads;
@@ -1104,18 +1189,19 @@ int matmul_decoder_step(MatmulDecoderContext* ctx,
         float* layer_v_cache = ctx->kv_cache->v_cache +
             (layer * ctx->kv_cache->max_seq_len * num_kv_heads * head_dim);
 
-        /* Save hidden for residual connection */
+        /* Save hidden for residual + input norm (CPU) */
+        _cpu_t0 = now_ms();
         memcpy(ctx->residual, ctx->hidden, hidden_dim * sizeof(float));
-
-        /* Input norm */
         rms_norm_f32(ctx->normed, ctx->hidden, lc->input_norm_w, hidden_dim, ctx->config.rms_eps);
+        _cpu_ops_ms += now_ms() - _cpu_t0;
 
         /* QKV projections */
         run_persistent_matmul(&lc->q_proj, ctx->normed, ctx->q_out);
         run_persistent_matmul(&lc->k_proj, ctx->normed, ctx->k_out);
         run_persistent_matmul(&lc->v_proj, ctx->normed, ctx->v_out);
 
-        /* QK norm */
+        /* QK norm + RoPE + attention (CPU) */
+        _cpu_t0 = now_ms();
         if (ctx->config.has_qk_norm && lc->q_norm_w && lc->k_norm_w) {
             for (int h = 0; h < num_q_heads; h++) {
                 float* q_head = ctx->q_out + h * head_dim;
@@ -1139,32 +1225,62 @@ int matmul_decoder_step(MatmulDecoderContext* ctx,
         memcpy(layer_v_cache + seq_len * num_kv_heads * head_dim, ctx->v_out,
                num_kv_heads * head_dim * sizeof(float));
 
-        /* Attention → o_proj → attention residual */
+        /* Attention (CPU) */
         attention_f32(ctx->attn_out, ctx->q_out, layer_k_cache, layer_v_cache,
                       num_q_heads, num_kv_heads, head_dim, seq_len + 1);
+        _cpu_ops_ms += now_ms() - _cpu_t0;
+
+        /* o_proj (NPU) + residual (CPU) */
         run_persistent_matmul(&lc->o_proj, ctx->attn_out, ctx->hidden);
+        _cpu_t0 = now_ms();
         vec_add_f32(ctx->hidden, ctx->residual, hidden_dim);
 
-        /* Post-attention norm + FFN + FFN residual.
-         * FFN writes to ffn_down (not hidden), so hidden is preserved
-         * and vec_add_f32 correctly adds ffn_down as residual. */
+        /* Post-attention norm + SiLU (CPU) */
         rms_norm_f32(ctx->normed, ctx->hidden, lc->post_attn_norm_w, hidden_dim, ctx->config.rms_eps);
+        _cpu_ops_ms += now_ms() - _cpu_t0;
+
+        /* FFN matmuls (NPU) */
         run_persistent_matmul(&lc->gate_proj, ctx->normed, ctx->ffn_gate);
         run_persistent_matmul(&lc->up_proj, ctx->normed, ctx->ffn_up);
+
+        /* SiLU + residual (CPU) */
+        _cpu_t0 = now_ms();
         silu_mul_f32(ctx->ffn_gate, ctx->ffn_gate, ctx->ffn_up, ffn_dim);
+        _cpu_ops_ms += now_ms() - _cpu_t0;
+
         run_persistent_matmul(&lc->down_proj, ctx->ffn_gate, ctx->ffn_down);
+
+        _cpu_t0 = now_ms();
         vec_add_f32(ctx->hidden, ctx->ffn_down, hidden_dim);
+        _cpu_ops_ms += now_ms() - _cpu_t0;
     }
 
-    /* Final norm (dedicated weight, not per-layer) */
+    /* Final norm (CPU) */
+    _cpu_t0 = now_ms();
     rms_norm_f32(ctx->normed, ctx->hidden,
                  ctx->final_norm_w, hidden_dim, ctx->config.rms_eps);
+    _cpu_ops_ms += now_ms() - _cpu_t0;
 
-    /* LM head: normed @ lm_head^T → logits (NEON-optimized GEMV) */
-    gemv_f32_neon(ctx->logits, ctx->normed, ctx->lm_head, vocab_size, hidden_dim);
+    /* LM head (NEON GEMV — use FP16 weights if available for 2x bandwidth) */
+    _cpu_t0 = now_ms();
+    if (ctx->lm_head_fp16) {
+        gemv_f16_neon(ctx->logits, ctx->normed, ctx->lm_head_fp16, vocab_size, hidden_dim);
+    } else {
+        gemv_f32_neon(ctx->logits, ctx->normed, ctx->lm_head, vocab_size, hidden_dim);
+    }
+    _lm_head_ms = now_ms() - _cpu_t0;
 
     /* Update KV cache */
     ctx->kv_cache->seq_len++;
+
+    /* Save stats */
+    ctx->stats.total_ms = (float)(now_ms() - _step_t0);
+    ctx->stats.matmul_ms = (float)_acc_matmul_ms;
+    ctx->stats.rebind_ms = (float)_acc_rebind_ms;
+    ctx->stats.convert_ms = (float)_acc_convert_ms;
+    ctx->stats.cpu_ops_ms = (float)_cpu_ops_ms;
+    ctx->stats.lm_head_ms = (float)_lm_head_ms;
+    ctx->stats.n_steps++;
 
     /* Copy logits if requested */
     if (output_logits) {
@@ -1346,6 +1462,8 @@ void matmul_decoder_destroy(MatmulDecoderContext* ctx) {
     } else if (!ctx->config.tie_word_embeddings) {
         free(ctx->lm_head);
     }
+    free(ctx->lm_head_fp16);
+
     /* final_norm_w: only free if it's NOT a borrowed pointer from last layer */
     if (ctx->final_norm_w && ctx->layers &&
         ctx->final_norm_w != ctx->layers[ctx->config.num_layers - 1].post_attn_norm_w) {
