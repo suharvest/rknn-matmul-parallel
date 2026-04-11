@@ -141,7 +141,8 @@ static rknn_matmul_type quant_to_rknn_type(QuantizationType quant_type) {
  * Returns pool index, or -1 on error.
  */
 static int pool_get_or_create(MatmulPoolEntry* pool, int* n_pool,
-                               int K, int N, QuantizationType quant_type) {
+                               int K, int N, QuantizationType quant_type,
+                               int iommu_domain_id) {
     /* Search existing */
     for (int i = 0; i < *n_pool; i++) {
         if (pool[i].K == K && pool[i].N == N) return i;
@@ -164,6 +165,7 @@ static int pool_get_or_create(MatmulPoolEntry* pool, int* n_pool,
     info.N = N;
     info.type = quant_to_rknn_type(quant_type);
     info.B_layout = 1;
+    info.iommu_domain_id = iommu_domain_id;
 
     int ret = rknn_matmul_create(&pe->ctx, &info, &pe->io);
     if (ret != 0) {
@@ -188,7 +190,8 @@ static int pool_get_or_create(MatmulPoolEntry* pool, int* n_pool,
     pe->N = N;
     pe->initialized = 1;
 
-    printf("[Pool] Created pool[%d]: K=%d N=%d (handles: 1 ctx + A + C = 3)\n", idx, K, N);
+    printf("[Pool] Created pool[%d]: K=%d N=%d domain=%d (handles: 1 ctx + A + C = 3)\n",
+           idx, K, N, iommu_domain_id);
     return idx;
 }
 
@@ -685,7 +688,8 @@ MatmulDecoderContext* matmul_decoder_create(const char* model_dir,
     int proj_pool_idx[7];
     for (int p = 0; p < 7; p++) {
         proj_pool_idx[p] = pool_get_or_create(ctx->pool, &ctx->n_pool,
-                                               proj_defs[p].K, proj_defs[p].N, quant_type);
+                                               proj_defs[p].K, proj_defs[p].N, quant_type,
+                                               config->iommu_domain_id);
         if (proj_pool_idx[p] < 0) {
             fprintf(stderr, "[MatmulDecoder] Failed to create pool for %s\n", proj_defs[p].name);
             matmul_decoder_destroy(ctx);
@@ -806,7 +810,8 @@ MatmulDecoderContext* matmul_decoder_create_from_weights(
             {ffn_dim, hidden_dim},                  /* down */
         };
         for (int d = 0; d < 5; d++) {
-            pool_get_or_create(ctx->pool, &ctx->n_pool, dims[d][0], dims[d][1], quant_type);
+            pool_get_or_create(ctx->pool, &ctx->n_pool, dims[d][0], dims[d][1], quant_type,
+                              config->iommu_domain_id);
         }
     }
 
@@ -824,7 +829,8 @@ MatmulDecoderContext* matmul_decoder_create_from_weights(
         };
         for (int p = 0; p < 7; p++) {
             int pidx = pool_get_or_create(ctx->pool, &ctx->n_pool,
-                                           proj_list[p].K, proj_list[p].N, quant_type);
+                                           proj_list[p].K, proj_list[p].N, quant_type,
+                                           config->iommu_domain_id);
             if (pidx >= 0) {
                 create_pooled_matmul(proj_list[p].pm, &ctx->pool[pidx]);
             }

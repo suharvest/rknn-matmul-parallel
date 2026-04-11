@@ -80,6 +80,14 @@ typedef struct {
     int num_lm_heads;           /* Number of lm_heads (0 or 1 = single head, >1 = multi) */
     int lm_head_vocab_size;     /* Per-head vocab size (only used when num_lm_heads > 1) */
 
+    /* IOMMU domain isolation (SDK >= V2.0.0-beta0).
+     * RKNN models (rknn_init) default to domain 0.
+     * Set this to 1+ so matmul contexts use a separate domain,
+     * avoiding IOMMU address space contention and 6s timeout EINVAL.
+     * 0 = default (same domain as RKNN models, may conflict).
+     * Valid range: 0-15 (RKNPU_MAX_IOMMU_DOMAIN_NUM=16). */
+    int iommu_domain_id;
+
     /* Execution mode */
     ExecutionMode exec_mode;    /* Single or dual NPU core */
 } MatmulDecoderConfig;
@@ -108,6 +116,7 @@ static inline MatmulDecoderConfig matmul_decoder_config_qwen3_0_6b(void) {
         .has_qk_norm = 1,  /* Qwen3 uses per-head QK norm */
         .num_lm_heads = 0, /* Single lm_head (standard LLM) */
         .lm_head_vocab_size = 0,
+        .iommu_domain_id = 1,  /* Separate from RKNN models on domain 0 */
         .exec_mode = EXEC_DUAL_CORE,  /* Use dual NPU core by default */
     };
 }
@@ -146,6 +155,7 @@ static inline MatmulDecoderConfig matmul_decoder_config_qwen3_tts_cp(void) {
         .has_qk_norm = 1,
         .num_lm_heads = 15,
         .lm_head_vocab_size = 2048,
+        .iommu_domain_id = 1,
         .exec_mode = EXEC_DUAL_CORE,
     };
 }
