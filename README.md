@@ -56,7 +56,7 @@ This library solves both: IOMMU domain isolation (`iommu_domain_id=1`) and conte
 
 - **Dual NPU core parallelism** via fork + persistent worker processes
 - **IOMMU domain isolation** — runs on separate domain from RKNN models, zero conflict
-- **Context pooling** — 28-layer decoder uses only ~211 NPU handles (vs 784 naive)
+- **Configurable context strategy** — pool (saves handles) or dedicated (fastest, no rebind overhead)
 - **Complete decoder stack**: KV cache, RoPE, RMSNorm, attention, FFN, sampling
 - **Multi lm_head support**: multiple output heads per step (e.g., Code Predictor with 15 heads)
 - **Python bindings**: `pip install` and use like RKLLM
@@ -227,6 +227,57 @@ This is a **model-agnostic** decoder. To adapt a new model:
 3. (Optional) Write export script for your model format
 
 See `examples/export_qwen3_asr.py` for reference.
+
+## Configuration Guide
+
+### Context Pool Mode
+
+The `context_pool_mode` setting controls how NPU matmul contexts are managed. This is the most impactful performance/compatibility tradeoff:
+
+| Mode | Value | NPU Handles | B Rebind | Best For |
+|------|-------|-------------|----------|----------|
+| **Auto** | `0` | adaptive | adaptive | Default — picks the best option automatically |
+| **Pool** | `1` | ~211 (28L) | Yes (~250ms) | Running alongside RKNN models (handle budget tight) |
+| **Dedicated** | `2` | ~784 (28L) | **No** | Standalone (fastest, no RKNN coexistence needed) |
+
+```c
+MatmulDecoderConfig config = matmul_decoder_config_qwen3_0_6b();
+
+// Auto (default): dedicated if handles fit, pool otherwise
+config.context_pool_mode = 0;
+
+// Force pool: when running alongside RKNN encoder/vocoder
+config.context_pool_mode = 1;
+
+// Force dedicated: maximum speed, no other RKNN models loaded
+config.context_pool_mode = 2;
+```
+
+**Why it matters:** Profile showed B rebind (`rknn_matmul_set_io_mem`) triggers an IOMMU page table update per call. With 196 calls/token (28 layers × 7 projections), this adds ~250ms — 56% of total latency. Dedicated mode eliminates this entirely.
+
+### Quantization
+
+| Type | Weight Size | Accuracy | Speed |
+|------|------------|----------|-------|
+| FP16 | 100% | Best | Baseline |
+| W4A16 | 25% | Good (cosine >0.997) | ~1.5x faster |
+| W8A16 | 50% | Better | ~1.2x faster |
+
+W4A16 uses per-column INT4 quantization with FP32 scales applied on CPU after NPU matmul.
+
+## Testing
+
+```bash
+# Generate numpy reference (one-time)
+python3 tests/generate_reference.py --model-dir /path/to/weights
+
+# Regression test (after code changes)
+python3 tests/test_regression.py --model-dir /path/to/weights
+
+# Performance benchmark
+python3 tests/benchmark.py --model-dir /path/to/weights --modes single_core
+python3 tests/benchmark.py --model-dir /path/to/w4a16_weights --quant-type int4
+```
 
 ## API Reference
 
