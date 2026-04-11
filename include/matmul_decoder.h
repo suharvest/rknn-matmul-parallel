@@ -76,6 +76,10 @@ typedef struct {
     /* Optional: QK norm (per-head RMSNorm on Q and K after projection) */
     int has_qk_norm;            /* 0=disabled, 1=enabled (Qwen3 uses this) */
 
+    /* Multi lm_head support (e.g., Code Predictor: 15 heads, each vocab=2048) */
+    int num_lm_heads;           /* Number of lm_heads (0 or 1 = single head, >1 = multi) */
+    int lm_head_vocab_size;     /* Per-head vocab size (only used when num_lm_heads > 1) */
+
     /* Execution mode */
     ExecutionMode exec_mode;    /* Single or dual NPU core */
 } MatmulDecoderConfig;
@@ -102,6 +106,8 @@ static inline MatmulDecoderConfig matmul_decoder_config_qwen3_0_6b(void) {
         .norm_type = 0,  /* RMSNorm */
         .ffn_act_type = 0, /* SwiGLU */
         .has_qk_norm = 1,  /* Qwen3 uses per-head QK norm */
+        .num_lm_heads = 0, /* Single lm_head (standard LLM) */
+        .lm_head_vocab_size = 0,
         .exec_mode = EXEC_DUAL_CORE,  /* Use dual NPU core by default */
     };
 }
@@ -113,6 +119,35 @@ static inline MatmulDecoderConfig matmul_decoder_config_qwen3_0_6b_single_core(v
     MatmulDecoderConfig config = matmul_decoder_config_qwen3_0_6b();
     config.exec_mode = EXEC_SINGLE_CORE;
     return config;
+}
+
+/**
+ * Default config for Qwen3-TTS Code Predictor (15 lm_heads, vocab=2048 each).
+ * 5-layer small transformer, autoregressive 15-step decode.
+ */
+static inline MatmulDecoderConfig matmul_decoder_config_qwen3_tts_cp(void) {
+    return (MatmulDecoderConfig){
+        .name = "qwen3-tts-cp",
+        .hidden_dim = 1024,
+        .num_q_heads = 16,
+        .num_kv_heads = 8,
+        .head_dim = 128,
+        .ffn_dim = 3072,
+        .num_layers = 5,
+        .vocab_size = 2048,     /* Per-head vocab size */
+        .max_seq_len = 20,      /* 2 prefill + 15 decode + margin */
+        .rms_eps = 1e-6f,
+        .rope_theta = 1000000.0f,
+        .tie_word_embeddings = 0,
+        .rope_scaling_factor = 1.0f,
+        .rope_scaling_type = 0,
+        .norm_type = 0,
+        .ffn_act_type = 0,
+        .has_qk_norm = 1,
+        .num_lm_heads = 15,
+        .lm_head_vocab_size = 2048,
+        .exec_mode = EXEC_DUAL_CORE,
+    };
 }
 
 /* ─── Quantization Type ─── */
@@ -253,6 +288,22 @@ int matmul_decoder_step_get_logits(MatmulDecoderContext* ctx,
                                     int token_id,
                                     const float* embedding,
                                     float* logits_out);
+
+/**
+ * Run one step with a specific lm_head (for multi-head models like Code Predictor).
+ *
+ * @param ctx           Decoder context
+ * @param token_id      Input token ID (ignored if embedding != NULL)
+ * @param embedding     Input embedding [hidden_dim] (NULL to use token_id)
+ * @param lm_head_idx   Which lm_head to use (0 to num_lm_heads-1)
+ * @param output_logits Output logits [lm_head_vocab_size] (can be NULL)
+ * @return              Sampled token ID (greedy) or error code
+ */
+int matmul_decoder_step_head(MatmulDecoderContext* ctx,
+                             int token_id,
+                             const float* embedding,
+                             int lm_head_idx,
+                             float* output_logits);
 
 /**
  * Clear KV cache for new sequence.

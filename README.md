@@ -51,6 +51,7 @@ Rockchip's RKLLM achieves ~16ms/token on Qwen3-ASR-0.6B, but:
 
 - **Dual NPU core parallelism** via fork + persistent worker processes
 - **Complete decoder stack**: KV cache, RoPE, RMSNorm, attention, FFN, sampling
+- **Multi lm_head support**: multiple output heads per step (e.g., Code Predictor with 15 heads)
 - **Python bindings**: `pip install` and use like RKLLM
 - **Model-agnostic config**: adapt to any decoder-only transformer
 - **INT4/INT8/FP16 quantization** support
@@ -163,12 +164,17 @@ Workers split the weight matrix columns, compute independently on separate NPU c
 
 ## Real-World Usage
 
-This library powers **Qwen3-ASR on RK3576**:
+This library powers real-world speech AI on RK3576:
 
-> [qwen3asr_rk](https://github.com/qzxyz/qwen3asr_rk) — 52-language streaming ASR
+**ASR Decoder** — [qwen3asr_rk](https://github.com/qzxyz/qwen3asr_rk), 52-language streaming ASR
 > - Encoder: RKNN FP16 merged model (431ms/4s chunk)
-> - **Decoder: This matmul library (~16ms/token)**
+> - **Decoder: This matmul library (~16ms/token, 28 layers, single lm_head)**
 > - End-to-end RTF: 0.44
+
+**TTS Code Predictor** — Qwen3-TTS autoregressive codec generation
+> - 5-layer transformer, 15 autoregressive steps
+> - **15 different lm_heads, one per step (vocab=2048 each)**
+> - Uses `matmul_decoder_step_head()` to select lm_head per step
 
 ## Model Adaptation
 
@@ -178,24 +184,37 @@ This is a **model-agnostic** decoder. To adapt a new model:
    ```
    model_dir/
    ├── config.json           # Model configuration
-   ├── embeddings.npy        # [vocab_size, hidden_dim]
+   ├── embeddings.bin        # [vocab_size, hidden_dim] FP32
+   ├── lm_head.bin           # [vocab_size, hidden_dim] (or lm_head_00..14.bin for multi-head)
    └── layers/
-       ├── layer_00.npz
+       ├── layer_00/
+       │   ├── q_proj.bin    # FP16 weights
+       │   ├── k_proj.bin
+       │   └── ...
        └── ...
    ```
 
-2. Create config with your model's architecture:
-   ```python
-   config = {
-       "hidden_dim": 1024,
-       "num_q_heads": 16,
-       "num_kv_heads": 8,
-       "head_dim": 64,
-       "ffn_dim": 3072,
-       "num_layers": 28,
-       "vocab_size": 151936,
-       "rope_theta": 1000000.0,
-   }
+2. Create config for your model:
+
+   **Standard LLM decoder** (single lm_head):
+   ```c
+   MatmulDecoderConfig config = {
+       .hidden_dim = 1024, .num_layers = 28,
+       .num_q_heads = 16, .num_kv_heads = 8, .head_dim = 128,
+       .ffn_dim = 3072, .vocab_size = 151936,
+   };
+   ```
+
+   **Multi-head decoder** (e.g., TTS Code Predictor):
+   ```c
+   MatmulDecoderConfig config = {
+       .hidden_dim = 1024, .num_layers = 5,
+       .num_q_heads = 16, .num_kv_heads = 8, .head_dim = 128,
+       .ffn_dim = 3072, .vocab_size = 2048,
+       .num_lm_heads = 15,          /* 15 different output heads */
+       .lm_head_vocab_size = 2048,  /* each head outputs 2048 logits */
+   };
+   // Use matmul_decoder_step_head(ctx, -1, embed, step_idx, logits)
    ```
 
 3. (Optional) Write export script for your model format
@@ -212,6 +231,10 @@ See `examples/export_qwen3_asr.py` for reference.
 | `rmp_run(ctx, input, output)` | Execute parallel matmul |
 | `rmp_destroy(ctx)` | Cleanup workers |
 | `rmp_benchmark(ctx, n_runs)` | Measure performance |
+| `matmul_decoder_create(dir, config, ...)` | Create decoder from weights directory |
+| `matmul_decoder_step(ctx, token, embed, logits)` | Run one decode step (single lm_head) |
+| `matmul_decoder_step_head(ctx, token, embed, idx, logits)` | Run one step with specific lm_head |
+| `matmul_decoder_destroy(ctx)` | Free decoder resources |
 
 ### Python API
 

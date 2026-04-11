@@ -61,7 +61,11 @@ struct MatmulDecoderContext {
 
     /* Embeddings */
     float* embeddings;          /* [vocab_size, hidden_dim] */
-    float* lm_head;             /* [vocab_size, hidden_dim] transposed for matmul */
+
+    /* LM head(s) */
+    float* lm_head;             /* Single lm_head: [vocab_size, hidden_dim] */
+    float** lm_heads;           /* Multi lm_head: [num_lm_heads][lm_head_vocab_size * hidden_dim] */
+    int num_lm_heads;           /* 0 = single head mode */
 
     /* Layer contexts */
     LayerMatmulContext* layers;
@@ -487,17 +491,43 @@ MatmulDecoderContext* matmul_decoder_create(const char* model_dir,
     }
     printf("[MatmulDecoder] Loaded embeddings: [%d, %d]\n", vocab_size, hidden_dim);
 
-    /* Load lm_head (optional) */
-    snprintf(path, sizeof(path), "%s/lm_head.bin", model_dir);
-    ctx->lm_head = load_fp32_file(path, vocab_size * hidden_dim);
-    if (!ctx->lm_head && !config->tie_word_embeddings) {
-        fprintf(stderr, "[MatmulDecoder] Failed to load lm_head from %s\n", path);
-        matmul_decoder_destroy(ctx);
-        return NULL;
-    }
-    if (config->tie_word_embeddings && !ctx->lm_head) {
-        ctx->lm_head = ctx->embeddings;  /* Share memory */
-        printf("[MatmulDecoder] Using tied embeddings for lm_head\n");
+    /* Load lm_head(s) */
+    int n_lm = config->num_lm_heads;
+    ctx->num_lm_heads = n_lm;
+
+    if (n_lm > 1) {
+        /* Multi lm_head mode (e.g., Code Predictor: 15 heads) */
+        int lm_vocab = config->lm_head_vocab_size > 0 ? config->lm_head_vocab_size : vocab_size;
+        ctx->lm_heads = calloc(n_lm, sizeof(float*));
+        if (!ctx->lm_heads) {
+            matmul_decoder_destroy(ctx);
+            return NULL;
+        }
+        for (int i = 0; i < n_lm; i++) {
+            snprintf(path, sizeof(path), "%s/lm_head_%02d.bin", model_dir, i);
+            ctx->lm_heads[i] = load_fp32_file(path, (size_t)lm_vocab * hidden_dim);
+            if (!ctx->lm_heads[i]) {
+                fprintf(stderr, "[MatmulDecoder] Failed to load lm_head_%02d from %s\n", i, path);
+                matmul_decoder_destroy(ctx);
+                return NULL;
+            }
+        }
+        ctx->lm_head = NULL;
+        printf("[MatmulDecoder] Loaded %d lm_heads (vocab=%d each)\n", n_lm, lm_vocab);
+    } else {
+        /* Single lm_head mode */
+        ctx->lm_heads = NULL;
+        snprintf(path, sizeof(path), "%s/lm_head.bin", model_dir);
+        ctx->lm_head = load_fp32_file(path, vocab_size * hidden_dim);
+        if (!ctx->lm_head && !config->tie_word_embeddings) {
+            fprintf(stderr, "[MatmulDecoder] Failed to load lm_head from %s\n", path);
+            matmul_decoder_destroy(ctx);
+            return NULL;
+        }
+        if (config->tie_word_embeddings && !ctx->lm_head) {
+            ctx->lm_head = ctx->embeddings;  /* Share memory */
+            printf("[MatmulDecoder] Using tied embeddings for lm_head\n");
+        }
     }
 
     /* Allocate layer contexts */
@@ -603,7 +633,9 @@ MatmulDecoderContext* matmul_decoder_create_from_weights(
     ctx->embeddings = malloc((size_t)vocab_size * hidden_dim * sizeof(float));
     memcpy(ctx->embeddings, embeddings, (size_t)vocab_size * hidden_dim * sizeof(float));
 
-    /* LM head */
+    /* LM head(s) */
+    ctx->num_lm_heads = config->num_lm_heads;
+    ctx->lm_heads = NULL;
     if (lm_head) {
         ctx->lm_head = malloc((size_t)vocab_size * hidden_dim * sizeof(float));
         memcpy(ctx->lm_head, lm_head, (size_t)vocab_size * hidden_dim * sizeof(float));
@@ -799,6 +831,120 @@ int matmul_decoder_step(MatmulDecoderContext* ctx,
     return predicted_token;
 }
 
+int matmul_decoder_step_head(MatmulDecoderContext* ctx,
+                             int token_id,
+                             const float* embedding,
+                             int lm_head_idx,
+                             float* output_logits) {
+    if (!ctx) return MATMUL_DECODER_ERR_INVALID_ARG;
+
+    /* Validate lm_head_idx */
+    if (ctx->num_lm_heads <= 1) {
+        /* Single-head mode: ignore lm_head_idx, use default lm_head */
+        return matmul_decoder_step(ctx, token_id, embedding, output_logits);
+    }
+    if (lm_head_idx < 0 || lm_head_idx >= ctx->num_lm_heads || !ctx->lm_heads) {
+        return MATMUL_DECODER_ERR_INVALID_ARG;
+    }
+
+    int hidden_dim = ctx->config.hidden_dim;
+    int num_layers = ctx->config.num_layers;
+    int num_q_heads = ctx->config.num_q_heads;
+    int num_kv_heads = ctx->config.num_kv_heads;
+    int head_dim = ctx->config.head_dim;
+    int ffn_dim = ctx->config.ffn_dim;
+    int lm_vocab = ctx->config.lm_head_vocab_size > 0
+                       ? ctx->config.lm_head_vocab_size
+                       : ctx->config.vocab_size;
+
+    /* Get embedding */
+    if (embedding) {
+        memcpy(ctx->hidden, embedding, hidden_dim * sizeof(float));
+    } else {
+        if (token_id < 0 || token_id >= ctx->config.vocab_size) {
+            return MATMUL_DECODER_ERR_INVALID_ARG;
+        }
+        memcpy(ctx->hidden, ctx->embeddings + token_id * hidden_dim, hidden_dim * sizeof(float));
+    }
+
+    /* Process each layer (identical to matmul_decoder_step) */
+    int seq_len = ctx->kv_cache->seq_len;
+
+    for (int layer = 0; layer < num_layers; layer++) {
+        LayerMatmulContext* lc = &ctx->layers[layer];
+        float* layer_k_cache = ctx->kv_cache->k_cache +
+            (layer * ctx->kv_cache->max_seq_len * num_kv_heads * head_dim);
+        float* layer_v_cache = ctx->kv_cache->v_cache +
+            (layer * ctx->kv_cache->max_seq_len * num_kv_heads * head_dim);
+
+        float normed[hidden_dim];
+        rms_norm_f32(normed, ctx->hidden, lc->input_norm_w, hidden_dim, ctx->config.rms_eps);
+
+        run_persistent_matmul(&lc->q_proj, normed, ctx->q_out);
+        run_persistent_matmul(&lc->k_proj, normed, ctx->k_out);
+        run_persistent_matmul(&lc->v_proj, normed, ctx->v_out);
+
+        if (ctx->config.has_qk_norm && lc->q_norm_w && lc->k_norm_w) {
+            for (int h = 0; h < num_q_heads; h++) {
+                float* q_head = ctx->q_out + h * head_dim;
+                rms_norm_f32(q_head, q_head, lc->q_norm_w, head_dim, ctx->config.rms_eps);
+            }
+            for (int h = 0; h < num_kv_heads; h++) {
+                float* k_head = ctx->k_out + h * head_dim;
+                rms_norm_f32(k_head, k_head, lc->k_norm_w, head_dim, ctx->config.rms_eps);
+            }
+        }
+
+        float* cos = ctx->cos_table + seq_len * (head_dim / 2);
+        float* sin = ctx->sin_table + seq_len * (head_dim / 2);
+        apply_rope_f32(ctx->q_out, cos, sin, num_q_heads, head_dim);
+        apply_rope_f32(ctx->k_out, cos, sin, num_kv_heads, head_dim);
+
+        memcpy(layer_k_cache + seq_len * num_kv_heads * head_dim, ctx->k_out,
+               num_kv_heads * head_dim * sizeof(float));
+        memcpy(layer_v_cache + seq_len * num_kv_heads * head_dim, ctx->v_out,
+               num_kv_heads * head_dim * sizeof(float));
+
+        attention_f32(ctx->attn_out, ctx->q_out, layer_k_cache, layer_v_cache,
+                      num_q_heads, num_kv_heads, head_dim, seq_len + 1);
+
+        run_persistent_matmul(&lc->o_proj, ctx->attn_out, ctx->hidden);
+        vec_add_f32(ctx->hidden, ctx->attn_out, hidden_dim);
+
+        rms_norm_f32(normed, ctx->hidden, lc->post_attn_norm_w, hidden_dim, ctx->config.rms_eps);
+
+        run_persistent_matmul(&lc->gate_proj, normed, ctx->ffn_gate);
+        run_persistent_matmul(&lc->up_proj, normed, ctx->ffn_up);
+        silu_mul_f32(ctx->ffn_gate, ctx->ffn_gate, ctx->ffn_up, ffn_dim);
+        run_persistent_matmul(&lc->down_proj, ctx->ffn_gate, ctx->ffn_down);
+
+        vec_add_f32(ctx->hidden, ctx->ffn_down, hidden_dim);
+    }
+
+    /* Final norm */
+    float final_normed[hidden_dim];
+    rms_norm_f32(final_normed, ctx->hidden,
+                 ctx->layers[num_layers - 1].post_attn_norm_w, hidden_dim, ctx->config.rms_eps);
+
+    /* Selected lm_head */
+    const float* head_w = ctx->lm_heads[lm_head_idx];
+    for (int v = 0; v < lm_vocab; v++) {
+        float sum = 0.0f;
+        for (int h = 0; h < hidden_dim; h++) {
+            sum += final_normed[h] * head_w[v * hidden_dim + h];
+        }
+        ctx->logits[v] = sum;
+    }
+
+    ctx->kv_cache->seq_len++;
+
+    if (output_logits) {
+        memcpy(output_logits, ctx->logits, lm_vocab * sizeof(float));
+    }
+
+    return argmax_f32(ctx->logits, lm_vocab);
+}
+
 void matmul_decoder_clear_kv_cache(MatmulDecoderContext* ctx) {
     if (ctx && ctx->kv_cache) {
         matmul_kv_cache_clear(ctx->kv_cache);
@@ -844,7 +990,12 @@ void matmul_decoder_destroy(MatmulDecoderContext* ctx) {
     /* Free other resources */
     matmul_kv_cache_destroy(ctx->kv_cache);
     free(ctx->embeddings);
-    if (!ctx->config.tie_word_embeddings) {
+    if (ctx->lm_heads) {
+        for (int i = 0; i < ctx->num_lm_heads; i++) {
+            free(ctx->lm_heads[i]);
+        }
+        free(ctx->lm_heads);
+    } else if (!ctx->config.tie_word_embeddings) {
         free(ctx->lm_head);
     }
     free(ctx->cos_table);
