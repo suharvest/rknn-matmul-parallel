@@ -103,6 +103,12 @@ struct MatmulDecoderContext {
     float** lm_heads;           /* Multi lm_head: [num_lm_heads][lm_head_vocab_size * hidden_dim] */
     int num_lm_heads;           /* 0 = single head mode */
 
+    /* NPU-tiled lm_head: reuse pool context, split vocab into tiles of pool_N */
+    int lm_npu_n_tiles;         /* Number of tiles (0 = use CPU GEMV) */
+    int lm_npu_tile_n;          /* N per tile (from pool entry, e.g. 2048) */
+    int lm_npu_pool_idx;        /* Which pool entry to reuse */
+    rknn_tensor_mem** lm_npu_B; /* [n_tiles] B weight DMA buffers */
+
     /* Layer contexts */
     LayerMatmulContext* layers;
 
@@ -997,6 +1003,78 @@ MatmulDecoderContext* matmul_decoder_create(const char* model_dir,
         printf("[MatmulDecoder] Loaded final_norm weight\n");
     }
 
+    /* NPU-tiled lm_head: create a dedicated FP16→FP32 pool context for lm_head.
+     * Cannot reuse INT4 layer pool — matmul type must match weights (FP16). */
+    ctx->lm_npu_n_tiles = 0;
+    if (ctx->lm_head_fp16 && n_lm <= 1) {
+        /* Create dedicated FP16 pool with B_layout=0 (normal, no native conversion).
+         * This avoids the rknn_B_normal_layout_to_native_layout issue and
+         * lets us memcpy FP16 weights directly to B buffers. */
+        int tile_n = 2048;
+        if (ctx->n_pool < MAX_MATMUL_POOL) {
+            int lm_pool_idx = ctx->n_pool++;
+            MatmulPoolEntry* pe = &ctx->pool[lm_pool_idx];
+            memset(pe, 0, sizeof(*pe));
+
+            rknn_matmul_info lm_info;
+            memset(&lm_info, 0, sizeof(lm_info));
+            lm_info.M = 1;
+            lm_info.K = hidden_dim;
+            lm_info.N = tile_n;
+            lm_info.type = RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32;
+            lm_info.B_layout = 1;  /* Native layout — requires conversion at init */
+            lm_info.iommu_domain_id = config->iommu_domain_id;
+            pe->info = lm_info;
+
+            int ret = rknn_matmul_create(&pe->ctx, &lm_info, &pe->io);
+            if (ret == 0) {
+                pe->mem_A = rknn_create_mem(pe->ctx, pe->io.A.size);
+                pe->mem_C = rknn_create_mem(pe->ctx, pe->io.C.size);
+                pe->K = hidden_dim; pe->N = tile_n; pe->initialized = 1;
+                rknn_matmul_set_io_mem(pe->ctx, pe->mem_A, &pe->io.A);
+                rknn_matmul_set_io_mem(pe->ctx, pe->mem_C, &pe->io.C);
+
+                int n_tiles = (vocab_size + tile_n - 1) / tile_n;
+                ctx->lm_npu_B = calloc(n_tiles, sizeof(rknn_tensor_mem*));
+                int ok = ctx->lm_npu_B != NULL;
+                for (int t = 0; t < n_tiles && ok; t++) {
+                    ctx->lm_npu_B[t] = rknn_create_mem(pe->ctx, pe->io.B.size);
+                    if (!ctx->lm_npu_B[t]) { ok = 0; break; }
+                    int v_start = t * tile_n;
+                    int v_count = tile_n;
+                    if (v_start + v_count > vocab_size) v_count = vocab_size - v_start;
+                    /* Transpose [vocab_tile, hidden] → [hidden, tile_n] then convert to native layout.
+                     * lm_head_fp16 is [vocab, hidden] row-major. B must be [K=hidden, N=tile_n]. */
+                    int16_t* tmp = calloc((size_t)hidden_dim * tile_n, sizeof(int16_t));
+                    const int16_t* src = ctx->lm_head_fp16 + (size_t)v_start * hidden_dim;
+                    for (int k = 0; k < hidden_dim; k++) {
+                        for (int n = 0; n < v_count; n++) {
+                            tmp[k * tile_n + n] = src[n * hidden_dim + k];
+                        }
+                    }
+                    rknn_B_normal_layout_to_native_layout(tmp, ctx->lm_npu_B[t]->virt_addr,
+                                                           hidden_dim, tile_n, &pe->info);
+                    free(tmp);
+                }
+                if (ok) {
+                    ctx->lm_npu_n_tiles = n_tiles;
+                    ctx->lm_npu_tile_n = tile_n;
+                    ctx->lm_npu_pool_idx = lm_pool_idx;
+                    printf("[MatmulDecoder] NPU lm_head: %d tiles × (%d,%d), B_layout=0, pool[%d]\n",
+                           n_tiles, hidden_dim, tile_n, lm_pool_idx);
+                } else {
+                    for (int t = 0; t < n_tiles && ctx->lm_npu_B; t++)
+                        if (ctx->lm_npu_B[t]) rknn_destroy_mem(pe->ctx, ctx->lm_npu_B[t]);
+                    free(ctx->lm_npu_B); ctx->lm_npu_B = NULL;
+                    printf("[MatmulDecoder] NPU lm_head tile alloc failed\n");
+                }
+            } else {
+                ctx->n_pool--;  /* Roll back failed pool entry */
+                printf("[MatmulDecoder] NPU lm_head context create failed\n");
+            }
+        }
+    }
+
     /* KV cache */
     ctx->kv_cache = matmul_kv_cache_create(num_layers, num_kv_heads, head_dim, max_seq_len);
 
@@ -1261,9 +1339,27 @@ int matmul_decoder_step(MatmulDecoderContext* ctx,
                  ctx->final_norm_w, hidden_dim, ctx->config.rms_eps);
     _cpu_ops_ms += now_ms() - _cpu_t0;
 
-    /* LM head (NEON GEMV — use FP16 weights if available for 2x bandwidth) */
+    /* LM head — NPU tiled (fastest) or CPU GEMV (fallback) */
     _cpu_t0 = now_ms();
-    if (ctx->lm_head_fp16) {
+    if (ctx->lm_npu_n_tiles > 0) {
+        /* NPU: run each tile through pool context, rebind B per tile */
+        MatmulPoolEntry* pe = &ctx->pool[ctx->lm_npu_pool_idx];
+        int tile_n = ctx->lm_npu_tile_n;
+
+        /* Write input to A once (FP32 → FP16) */
+        vec_fp32_to_fp16((int16_t*)pe->mem_A->virt_addr, ctx->normed, hidden_dim);
+
+        for (int t = 0; t < ctx->lm_npu_n_tiles; t++) {
+            rknn_matmul_set_io_mem(pe->ctx, ctx->lm_npu_B[t], &pe->io.B);
+            rknn_matmul_run(pe->ctx);
+
+            /* Copy FP32 output to logits slice */
+            int v_start = t * tile_n;
+            int v_count = tile_n;
+            if (v_start + v_count > vocab_size) v_count = vocab_size - v_start;
+            memcpy(ctx->logits + v_start, pe->mem_C->virt_addr, v_count * sizeof(float));
+        }
+    } else if (ctx->lm_head_fp16) {
         gemv_f16_neon(ctx->logits, ctx->normed, ctx->lm_head_fp16, vocab_size, hidden_dim);
     } else {
         gemv_f32_neon(ctx->logits, ctx->normed, ctx->lm_head, vocab_size, hidden_dim);
