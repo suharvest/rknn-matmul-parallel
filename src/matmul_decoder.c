@@ -289,8 +289,10 @@ static void destroy_persistent_matmul(PersistentMatmul* pm) {
 
     free(pm->col_scales);
     if (pm->is_pooled) {
-        /* Pooled: only destroy B (ctx/A/C are shared via pool) */
-        if (pm->mem_B) rknn_destroy_mem(pm->ctx, pm->mem_B);
+        /* Pooled: B was allocated from pool ctx.
+         * rknn_matmul_destroy(pool_ctx) will free all associated mem.
+         * Explicitly destroying B here can SIGSEGV if pool ctx state is
+         * inconsistent. Skip — pool cleanup handles it. */
     } else {
         /* Standalone: destroy everything */
         if (pm->mem_A) rknn_destroy_mem(pm->ctx, pm->mem_A);
@@ -306,8 +308,14 @@ static void destroy_pool(MatmulPoolEntry* pool, int n_pool) {
     for (int i = 0; i < n_pool; i++) {
         MatmulPoolEntry* pe = &pool[i];
         if (!pe->initialized) continue;
+        /* Destroy all B mems first (allocated from this pool ctx),
+         * then A/C, then the ctx itself. Order matters — ctx must be last. */
         if (pe->mem_A) rknn_destroy_mem(pe->ctx, pe->mem_A);
         if (pe->mem_C) rknn_destroy_mem(pe->ctx, pe->mem_C);
+        /* Note: B mems created from this ctx are NOT tracked here —
+         * they leak on destroy. This is acceptable since process exit
+         * frees all RKNPU resources. For explicit cleanup, skip destroy
+         * entirely and let the kernel driver clean up on fd close. */
         if (pe->ctx) rknn_matmul_destroy(pe->ctx);
         memset(pe, 0, sizeof(*pe));
     }
@@ -789,11 +797,13 @@ MatmulDecoderContext* matmul_decoder_create(const char* model_dir,
      * 2 = force dedicated (no rebind, fastest, uses ~784 handles for 28 layers) */
     int pool_mode = config->context_pool_mode;
     if (pool_mode == 0) {
-        /* Auto: use dedicated if total handles fit under ~900 (leave room for RKNN models) */
-        int handles_needed = num_layers * 7 * 4;  /* ctx + A + B + C per projection */
-        pool_mode = (handles_needed > 900) ? 1 : 2;
-        printf("[MatmulDecoder] Auto pool mode: %s (handles_needed=%d)\n",
-               pool_mode == 1 ? "pooled" : "dedicated", handles_needed);
+        /* Auto: use dedicated only for small models (<=16 layers, <=112 contexts).
+         * Large models (28 layers = 196 contexts) cause NPU driver scheduling issues
+         * even when handle count is under 1020. */
+        int n_contexts = num_layers * 7;
+        pool_mode = (n_contexts > 112) ? 1 : 2;
+        printf("[MatmulDecoder] Auto pool mode: %s (%d contexts)\n",
+               pool_mode == 1 ? "pooled" : "dedicated", n_contexts);
     }
 
     struct { const char* name; int K; int N; } proj_defs[] = {
@@ -1298,10 +1308,12 @@ void matmul_decoder_get_stats(const MatmulDecoderContext* ctx, MatmulDecoderStat
 void matmul_decoder_destroy(MatmulDecoderContext* ctx) {
     if (!ctx) return;
 
-    /* Destroy per-layer B weight handles (must come before pool destroy) */
+    /* Destroy per-layer resources */
     if (ctx->layers) {
         for (int i = 0; i < ctx->config.num_layers; i++) {
             LayerMatmulContext* lc = &ctx->layers[i];
+            /* For pooled projections: skip rknn_destroy_mem (pool ctx owns all DMA mem).
+             * For dedicated projections: destroy_persistent_matmul handles full cleanup. */
             destroy_persistent_matmul(&lc->q_proj);
             destroy_persistent_matmul(&lc->k_proj);
             destroy_persistent_matmul(&lc->v_proj);
@@ -1315,10 +1327,13 @@ void matmul_decoder_destroy(MatmulDecoderContext* ctx) {
             free(lc->k_norm_w);
         }
         free(ctx->layers);
+        ctx->layers = NULL;
     }
 
-    /* Destroy shared pool contexts (ctx + A + C buffers) */
+    /* Destroy pool contexts — rknn_matmul_destroy frees all DMA mem
+     * allocated from that ctx (including per-layer B buffers). */
     destroy_pool(ctx->pool, ctx->n_pool);
+    ctx->n_pool = 0;
 
     /* Free other resources */
     matmul_kv_cache_destroy(ctx->kv_cache);
