@@ -103,11 +103,13 @@ struct MatmulDecoderContext {
     float** lm_heads;           /* Multi lm_head: [num_lm_heads][lm_head_vocab_size * hidden_dim] */
     int num_lm_heads;           /* 0 = single head mode */
 
-    /* NPU-tiled lm_head: reuse pool context, split vocab into tiles of pool_N */
+    /* NPU-tiled lm_head: reuse pool context, split vocab into tiles */
     int lm_npu_n_tiles;         /* Number of tiles (0 = use CPU GEMV) */
-    int lm_npu_tile_n;          /* N per tile (from pool entry, e.g. 2048) */
-    int lm_npu_pool_idx;        /* Which pool entry to reuse */
+    int lm_npu_tile_n;          /* N per tile */
+    int lm_npu_pool_idx;        /* Which pool entry to use */
+    int lm_npu_is_int4;         /* 1 = INT4 weights with per-column scales */
     rknn_tensor_mem** lm_npu_B; /* [n_tiles] B weight DMA buffers */
+    float** lm_npu_scales;      /* [n_tiles] per-column scales [tile_n] (NULL if FP16) */
 
     /* Layer contexts */
     LayerMatmulContext* layers;
@@ -1003,75 +1005,119 @@ MatmulDecoderContext* matmul_decoder_create(const char* model_dir,
         printf("[MatmulDecoder] Loaded final_norm weight\n");
     }
 
-    /* NPU-tiled lm_head: create a dedicated FP16→FP32 pool context for lm_head.
-     * Cannot reuse INT4 layer pool — matmul type must match weights (FP16). */
+    /* NPU-tiled lm_head with INT4 quantization.
+     * Quantize FP16 lm_head → INT4 at init, use per-column scales at runtime.
+     * Separate from layer projections (which may be FP16 or INT4 independently). */
     ctx->lm_npu_n_tiles = 0;
-    if (ctx->lm_head_fp16 && n_lm <= 1) {
-        /* Create dedicated FP16 pool with B_layout=0 (normal, no native conversion).
-         * This avoids the rknn_B_normal_layout_to_native_layout issue and
-         * lets us memcpy FP16 weights directly to B buffers. */
+    ctx->lm_npu_is_int4 = 0;
+    ctx->lm_npu_scales = NULL;
+    if (ctx->lm_head_fp16 && n_lm <= 1 && ctx->n_pool < MAX_MATMUL_POOL) {
         int tile_n = 4096;
-        if (ctx->n_pool < MAX_MATMUL_POOL) {
-            int lm_pool_idx = ctx->n_pool++;
-            MatmulPoolEntry* pe = &ctx->pool[lm_pool_idx];
-            memset(pe, 0, sizeof(*pe));
+        int n_tiles = (vocab_size + tile_n - 1) / tile_n;
+        int lm_pool_idx = ctx->n_pool++;
+        MatmulPoolEntry* pe = &ctx->pool[lm_pool_idx];
+        memset(pe, 0, sizeof(*pe));
 
-            rknn_matmul_info lm_info;
-            memset(&lm_info, 0, sizeof(lm_info));
-            lm_info.M = 1;
-            lm_info.K = hidden_dim;
-            lm_info.N = tile_n;
-            lm_info.type = RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32;
-            lm_info.B_layout = 1;  /* Native layout — requires conversion at init */
-            lm_info.iommu_domain_id = config->iommu_domain_id;
-            pe->info = lm_info;
+        rknn_matmul_info lm_info;
+        memset(&lm_info, 0, sizeof(lm_info));
+        lm_info.M = 1;
+        lm_info.K = hidden_dim;
+        lm_info.N = tile_n;
+        lm_info.type = RKNN_FLOAT16_MM_INT4_TO_FLOAT16;
+        lm_info.B_layout = 1;
+        lm_info.iommu_domain_id = config->iommu_domain_id;
+        pe->info = lm_info;
 
-            int ret = rknn_matmul_create(&pe->ctx, &lm_info, &pe->io);
-            if (ret == 0) {
-                pe->mem_A = rknn_create_mem(pe->ctx, pe->io.A.size);
-                pe->mem_C = rknn_create_mem(pe->ctx, pe->io.C.size);
-                pe->K = hidden_dim; pe->N = tile_n; pe->initialized = 1;
-                rknn_matmul_set_io_mem(pe->ctx, pe->mem_A, &pe->io.A);
-                rknn_matmul_set_io_mem(pe->ctx, pe->mem_C, &pe->io.C);
+        int ret = rknn_matmul_create(&pe->ctx, &lm_info, &pe->io);
+        if (ret == 0) {
+            pe->mem_A = rknn_create_mem(pe->ctx, pe->io.A.size);
+            pe->mem_C = rknn_create_mem(pe->ctx, pe->io.C.size);
+            pe->K = hidden_dim; pe->N = tile_n; pe->initialized = 1;
+            rknn_matmul_set_io_mem(pe->ctx, pe->mem_A, &pe->io.A);
+            rknn_matmul_set_io_mem(pe->ctx, pe->mem_C, &pe->io.C);
 
-                int n_tiles = (vocab_size + tile_n - 1) / tile_n;
-                ctx->lm_npu_B = calloc(n_tiles, sizeof(rknn_tensor_mem*));
-                int ok = ctx->lm_npu_B != NULL;
-                for (int t = 0; t < n_tiles && ok; t++) {
-                    ctx->lm_npu_B[t] = rknn_create_mem(pe->ctx, pe->io.B.size);
-                    if (!ctx->lm_npu_B[t]) { ok = 0; break; }
-                    int v_start = t * tile_n;
-                    int v_count = tile_n;
-                    if (v_start + v_count > vocab_size) v_count = vocab_size - v_start;
-                    /* Transpose [vocab_tile, hidden] → [hidden, tile_n] then convert to native layout.
-                     * lm_head_fp16 is [vocab, hidden] row-major. B must be [K=hidden, N=tile_n]. */
-                    int16_t* tmp = calloc((size_t)hidden_dim * tile_n, sizeof(int16_t));
-                    const int16_t* src = ctx->lm_head_fp16 + (size_t)v_start * hidden_dim;
-                    for (int k = 0; k < hidden_dim; k++) {
-                        for (int n = 0; n < v_count; n++) {
-                            tmp[k * tile_n + n] = src[n * hidden_dim + k];
-                        }
+            ctx->lm_npu_B = calloc(n_tiles, sizeof(rknn_tensor_mem*));
+            ctx->lm_npu_scales = calloc(n_tiles, sizeof(float*));
+            int ok = ctx->lm_npu_B && ctx->lm_npu_scales;
+
+            for (int t = 0; t < n_tiles && ok; t++) {
+                ctx->lm_npu_B[t] = rknn_create_mem(pe->ctx, pe->io.B.size);
+                if (!ctx->lm_npu_B[t]) { ok = 0; break; }
+
+                int v_start = t * tile_n;
+                int v_count = tile_n;
+                if (v_start + v_count > vocab_size) v_count = vocab_size - v_start;
+
+                /* Transpose FP16 [vocab_tile, hidden] → FP32 [hidden, tile_n] for quantization */
+                float* transposed = calloc((size_t)hidden_dim * tile_n, sizeof(float));
+                const int16_t* src_fp16 = ctx->lm_head_fp16 + (size_t)v_start * hidden_dim;
+                for (int k = 0; k < hidden_dim; k++) {
+                    for (int n = 0; n < v_count; n++) {
+                        /* FP16 → FP32 manual conversion */
+                        transposed[k * tile_n + n] = (float)(*(const __fp16*)(src_fp16 + n * hidden_dim + k));
                     }
-                    rknn_B_normal_layout_to_native_layout(tmp, ctx->lm_npu_B[t]->virt_addr,
-                                                           hidden_dim, tile_n, &pe->info);
-                    free(tmp);
                 }
-                if (ok) {
-                    ctx->lm_npu_n_tiles = n_tiles;
-                    ctx->lm_npu_tile_n = tile_n;
-                    ctx->lm_npu_pool_idx = lm_pool_idx;
-                    printf("[MatmulDecoder] NPU lm_head: %d tiles × (%d,%d), B_layout=0, pool[%d]\n",
-                           n_tiles, hidden_dim, tile_n, lm_pool_idx);
-                } else {
-                    for (int t = 0; t < n_tiles && ctx->lm_npu_B; t++)
-                        if (ctx->lm_npu_B[t]) rknn_destroy_mem(pe->ctx, ctx->lm_npu_B[t]);
-                    free(ctx->lm_npu_B); ctx->lm_npu_B = NULL;
-                    printf("[MatmulDecoder] NPU lm_head tile alloc failed\n");
+
+                /* Per-column INT4 quantization: scale = max(|col|) / 7 */
+                float* scales = calloc(tile_n, sizeof(float));
+                ctx->lm_npu_scales[t] = scales;
+                int8_t* quantized = calloc((size_t)hidden_dim * tile_n, sizeof(int8_t));
+
+                for (int n = 0; n < tile_n; n++) {
+                    float col_max = 0;
+                    for (int k = 0; k < hidden_dim; k++) {
+                        float v = fabsf(transposed[k * tile_n + n]);
+                        if (v > col_max) col_max = v;
+                    }
+                    scales[n] = col_max / 7.0f;
+                    float inv_scale = (col_max > 0) ? 7.0f / col_max : 0;
+                    for (int k = 0; k < hidden_dim; k++) {
+                        int q = (int)roundf(transposed[k * tile_n + n] * inv_scale);
+                        if (q < -8) q = -8;
+                        if (q > 7) q = 7;
+                        quantized[k * tile_n + n] = (int8_t)q;
+                    }
                 }
-            } else {
-                ctx->n_pool--;  /* Roll back failed pool entry */
-                printf("[MatmulDecoder] NPU lm_head context create failed\n");
+
+                /* Pack INT4: two values per byte (lo/hi nibble), [K, N/2] */
+                uint8_t* packed = calloc((size_t)hidden_dim * tile_n / 2, 1);
+                for (int k = 0; k < hidden_dim; k++) {
+                    for (int n = 0; n < tile_n; n += 2) {
+                        int8_t lo = quantized[k * tile_n + n];
+                        int8_t hi = (n + 1 < tile_n) ? quantized[k * tile_n + n + 1] : 0;
+                        packed[k * (tile_n / 2) + n / 2] = ((uint8_t)(lo & 0xF)) | ((uint8_t)(hi & 0xF) << 4);
+                    }
+                }
+
+                /* Convert packed INT4 to native layout */
+                rknn_B_normal_layout_to_native_layout(packed, ctx->lm_npu_B[t]->virt_addr,
+                                                       hidden_dim, tile_n, &pe->info);
+                free(packed);
+                free(quantized);
+                free(transposed);
             }
+
+            if (ok) {
+                ctx->lm_npu_n_tiles = n_tiles;
+                ctx->lm_npu_tile_n = tile_n;
+                ctx->lm_npu_pool_idx = lm_pool_idx;
+                ctx->lm_npu_is_int4 = 1;
+                printf("[MatmulDecoder] NPU lm_head INT4: %d tiles × (%d,%d), pool[%d]\n",
+                       n_tiles, hidden_dim, tile_n, lm_pool_idx);
+            } else {
+                for (int t = 0; t < n_tiles; t++) {
+                    if (ctx->lm_npu_B && ctx->lm_npu_B[t])
+                        rknn_destroy_mem(pe->ctx, ctx->lm_npu_B[t]);
+                    if (ctx->lm_npu_scales) free(ctx->lm_npu_scales[t]);
+                }
+                free(ctx->lm_npu_B); ctx->lm_npu_B = NULL;
+                free(ctx->lm_npu_scales); ctx->lm_npu_scales = NULL;
+                ctx->n_pool--;
+                printf("[MatmulDecoder] NPU lm_head INT4 failed\n");
+            }
+        } else {
+            ctx->n_pool--;
+            printf("[MatmulDecoder] NPU lm_head context create failed (ret=%d)\n", ret);
         }
     }
 
@@ -1342,22 +1388,40 @@ int matmul_decoder_step(MatmulDecoderContext* ctx,
     /* LM head — NPU tiled (fastest) or CPU GEMV (fallback) */
     _cpu_t0 = now_ms();
     if (ctx->lm_npu_n_tiles > 0) {
-        /* NPU: run each tile through pool context, rebind B per tile */
+        /* NPU tiled lm_head */
         MatmulPoolEntry* pe = &ctx->pool[ctx->lm_npu_pool_idx];
         int tile_n = ctx->lm_npu_tile_n;
 
-        /* Write input to A once (FP32 → FP16) */
+        /* Write input to A once */
         vec_fp32_to_fp16((int16_t*)pe->mem_A->virt_addr, ctx->normed, hidden_dim);
 
         for (int t = 0; t < ctx->lm_npu_n_tiles; t++) {
             rknn_matmul_set_io_mem(pe->ctx, ctx->lm_npu_B[t], &pe->io.B);
             rknn_matmul_run(pe->ctx);
 
-            /* Copy FP32 output to logits slice */
             int v_start = t * tile_n;
             int v_count = tile_n;
             if (v_start + v_count > vocab_size) v_count = vocab_size - v_start;
-            memcpy(ctx->logits + v_start, pe->mem_C->virt_addr, v_count * sizeof(float));
+
+            if (ctx->lm_npu_is_int4 && ctx->lm_npu_scales && ctx->lm_npu_scales[t]) {
+                /* INT4→FP16 output: convert to FP32 and apply per-column scales */
+                const int16_t* c_fp16 = (const int16_t*)pe->mem_C->virt_addr;
+                const float* scales = ctx->lm_npu_scales[t];
+                float* dst = ctx->logits + v_start;
+                int n = 0;
+                for (; n <= v_count - 4; n += 4) {
+                    float16x4_t h = vld1_f16((const __fp16*)(c_fp16 + n));
+                    float32x4_t f = vcvt_f32_f16(h);
+                    float32x4_t s = vld1q_f32(scales + n);
+                    vst1q_f32(dst + n, vmulq_f32(f, s));
+                }
+                for (; n < v_count; n++) {
+                    dst[n] = (float)(*(const __fp16*)(c_fp16 + n)) * scales[n];
+                }
+            } else {
+                /* FP16→FP32 output: direct copy */
+                memcpy(ctx->logits + v_start, pe->mem_C->virt_addr, v_count * sizeof(float));
+            }
         }
     } else if (ctx->lm_head_fp16) {
         gemv_f16_neon(ctx->logits, ctx->normed, ctx->lm_head_fp16, vocab_size, hidden_dim);
@@ -1559,6 +1623,12 @@ void matmul_decoder_destroy(MatmulDecoderContext* ctx) {
         free(ctx->lm_head);
     }
     free(ctx->lm_head_fp16);
+    if (ctx->lm_npu_scales) {
+        for (int t = 0; t < ctx->lm_npu_n_tiles; t++)
+            free(ctx->lm_npu_scales[t]);
+        free(ctx->lm_npu_scales);
+    }
+    free(ctx->lm_npu_B);  /* DMA mem freed by pool destroy */
 
     /* final_norm_w: only free if it's NOT a borrowed pointer from last layer */
     if (ctx->final_norm_w && ctx->layers &&
