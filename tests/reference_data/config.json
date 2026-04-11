@@ -1,0 +1,13 @@
+{
+  "token_id": 151644,
+  "model_dir": "/home/cat/qwen3-asr-models/decoder/matmul",
+  "num_layers": 28,
+  "expected_top1": 87752,
+  "expected_top5": [
+    87752,
+    14558,
+    33975,
+    14293,
+    100677
+  ]
+}
