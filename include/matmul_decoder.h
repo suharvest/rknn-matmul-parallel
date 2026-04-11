@@ -83,6 +83,13 @@ typedef struct {
     int num_lm_heads;           /* Number of lm_heads (0 or 1 = single head, >1 = multi) */
     int lm_head_vocab_size;     /* Per-head vocab size (only used when num_lm_heads > 1) */
 
+    /* Context pooling strategy.
+     * 0 = auto (pool if num_layers * 7 > 128, else dedicated)
+     * 1 = force pool (share ctx/A/C, rebind B each run — saves handles, ~250ms overhead)
+     * 2 = force dedicated (one context per projection — no rebind, fastest, uses more handles)
+     * For 28-layer models: dedicated uses ~784 handles (under 1020 limit if no RKNN coexistence) */
+    int context_pool_mode;
+
     /* IOMMU domain isolation (SDK >= V2.0.0-beta0).
      * RKNN models (rknn_init) default to domain 0.
      * Set this to 1+ so matmul contexts use a separate domain,

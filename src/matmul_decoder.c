@@ -38,7 +38,8 @@ typedef struct {
     int is_pooled;          /* 1 = ctx/A/C are shared, only destroy B */
     int output_is_fp32;     /* 1 = C output is FP32 (FLOAT16_TO_FLOAT32) */
     float* col_scales;      /* Per-column W4A16 scales [N] (NULL for FP16) */
-    rknn_matmul_info* pool_info;  /* Points to pool's info (for B layout conversion) */
+    rknn_matmul_info* pool_info;  /* Points to pool's info or own_info (for B layout conversion) */
+    rknn_matmul_info _own_info;   /* Stored copy for dedicated mode (pool_info points here) */
 } PersistentMatmul;
 
 /**
@@ -240,7 +241,7 @@ static int create_pooled_matmul(PersistentMatmul* pm, MatmulPoolEntry* pe) {
  * Legacy: create standalone matmul context (for small models / non-pooled mode).
  */
 static int create_persistent_matmul(PersistentMatmul* pm, int M, int K, int N,
-                                     QuantizationType quant_type) {
+                                     QuantizationType quant_type, int iommu_domain_id) {
     memset(pm, 0, sizeof(PersistentMatmul));
 
     rknn_matmul_info info;
@@ -250,6 +251,7 @@ static int create_persistent_matmul(PersistentMatmul* pm, int M, int K, int N,
     info.N = N;
     info.type = quant_to_rknn_type(quant_type);
     info.B_layout = 1;
+    info.iommu_domain_id = iommu_domain_id;
 
     int ret = rknn_matmul_create(&pm->ctx, &info, &pm->io);
     if (ret != 0) {
@@ -275,7 +277,9 @@ static int create_persistent_matmul(PersistentMatmul* pm, int M, int K, int N,
     pm->initialized = 1;
     pm->is_pooled = 0;
     pm->output_is_fp32 = (info.type == RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32);
-    pm->pool_info = NULL;
+    /* Store info for B layout conversion (dedicated mode has no pool) */
+    pm->_own_info = info;
+    pm->pool_info = &pm->_own_info;
 
     return MATMUL_DECODER_OK;
 }
@@ -779,10 +783,19 @@ MatmulDecoderContext* matmul_decoder_create(const char* model_dir,
         return NULL;
     }
 
-    /* Build context pool — one entry per unique (K, N) dimension pair.
-     * For Qwen3-0.6B: 5 unique pairs instead of 196 standalone contexts.
-     * Saves ~573 NPU handles (from 784 down to ~211). */
-    ctx->n_pool = 0;
+    /* Decide pooling strategy:
+     * 0 = auto: pool if layers*7 > 128 AND handle budget is tight
+     * 1 = force pool (saves handles, ~250ms rebind overhead)
+     * 2 = force dedicated (no rebind, fastest, uses ~784 handles for 28 layers) */
+    int pool_mode = config->context_pool_mode;
+    if (pool_mode == 0) {
+        /* Auto: use dedicated if total handles fit under ~900 (leave room for RKNN models) */
+        int handles_needed = num_layers * 7 * 4;  /* ctx + A + B + C per projection */
+        pool_mode = (handles_needed > 900) ? 1 : 2;
+        printf("[MatmulDecoder] Auto pool mode: %s (handles_needed=%d)\n",
+               pool_mode == 1 ? "pooled" : "dedicated", handles_needed);
+    }
+
     struct { const char* name; int K; int N; } proj_defs[] = {
         {"q_proj",    hidden_dim,              num_q_heads * head_dim},
         {"k_proj",    hidden_dim,              num_kv_heads * head_dim},
@@ -792,34 +805,65 @@ MatmulDecoderContext* matmul_decoder_create(const char* model_dir,
         {"up_proj",   hidden_dim,              ffn_dim},
         {"down_proj", ffn_dim,                 hidden_dim},
     };
-    int proj_pool_idx[7];
-    for (int p = 0; p < 7; p++) {
-        proj_pool_idx[p] = pool_get_or_create(ctx->pool, &ctx->n_pool,
-                                               proj_defs[p].K, proj_defs[p].N, quant_type,
-                                               config->iommu_domain_id);
-        if (proj_pool_idx[p] < 0) {
-            fprintf(stderr, "[MatmulDecoder] Failed to create pool for %s\n", proj_defs[p].name);
-            matmul_decoder_destroy(ctx);
-            return NULL;
-        }
-    }
-    printf("[MatmulDecoder] Context pool: %d entries (from 7 projection types)\n", ctx->n_pool);
 
-    /* Create per-layer projections — only B weight is per-projection */
-    printf("[MatmulDecoder] Creating %d layers × 7 projections (pooled, B-only handles)...\n", num_layers);
+    ctx->n_pool = 0;
 
-    for (int i = 0; i < num_layers; i++) {
-        LayerMatmulContext* lc = &ctx->layers[i];
-        PersistentMatmul* pms[] = {
-            &lc->q_proj, &lc->k_proj, &lc->v_proj, &lc->o_proj,
-            &lc->gate_proj, &lc->up_proj, &lc->down_proj
-        };
+    if (pool_mode == 1) {
+        /* Pooled mode: share ctx/A/C, rebind B each run */
+        int proj_pool_idx[7];
         for (int p = 0; p < 7; p++) {
-            int ret = create_pooled_matmul(pms[p], &ctx->pool[proj_pool_idx[p]]);
-            if (ret != 0) {
-                fprintf(stderr, "Layer %d %s failed\n", i, proj_defs[p].name);
+            proj_pool_idx[p] = pool_get_or_create(ctx->pool, &ctx->n_pool,
+                                                   proj_defs[p].K, proj_defs[p].N, quant_type,
+                                                   config->iommu_domain_id);
+            if (proj_pool_idx[p] < 0) {
+                fprintf(stderr, "[MatmulDecoder] Failed to create pool for %s\n", proj_defs[p].name);
+                matmul_decoder_destroy(ctx);
+                return NULL;
             }
         }
+        printf("[MatmulDecoder] Pooled: %d pool entries, %d B handles\n", ctx->n_pool, num_layers * 7);
+
+        for (int i = 0; i < num_layers; i++) {
+            LayerMatmulContext* lc = &ctx->layers[i];
+            PersistentMatmul* pms[] = {
+                &lc->q_proj, &lc->k_proj, &lc->v_proj, &lc->o_proj,
+                &lc->gate_proj, &lc->up_proj, &lc->down_proj
+            };
+            for (int p = 0; p < 7; p++) {
+                int ret = create_pooled_matmul(pms[p], &ctx->pool[proj_pool_idx[p]]);
+                if (ret != 0) {
+                    fprintf(stderr, "Layer %d %s failed\n", i, proj_defs[p].name);
+                }
+            }
+        }  /* end pooled for-loop */
+    } else {
+        /* Dedicated mode: one context per projection, no rebind (fastest) */
+        printf("[MatmulDecoder] Dedicated: %d contexts (no B rebind)\n", num_layers * 7);
+
+        for (int i = 0; i < num_layers; i++) {
+            LayerMatmulContext* lc = &ctx->layers[i];
+            struct { PersistentMatmul* pm; int K; int N; } pl[] = {
+                {&lc->q_proj,    proj_defs[0].K, proj_defs[0].N},
+                {&lc->k_proj,    proj_defs[1].K, proj_defs[1].N},
+                {&lc->v_proj,    proj_defs[2].K, proj_defs[2].N},
+                {&lc->o_proj,    proj_defs[3].K, proj_defs[3].N},
+                {&lc->gate_proj, proj_defs[4].K, proj_defs[4].N},
+                {&lc->up_proj,   proj_defs[5].K, proj_defs[5].N},
+                {&lc->down_proj, proj_defs[6].K, proj_defs[6].N},
+            };
+            for (int p = 0; p < 7; p++) {
+                int ret = create_persistent_matmul(pl[p].pm, 1, pl[p].K, pl[p].N, quant_type,
+                                                     config->iommu_domain_id);
+                if (ret != 0) {
+                    fprintf(stderr, "Layer %d %s failed\n", i, proj_defs[p].name);
+                }
+            }
+        }  /* end dedicated for-loop body */
+    }  /* end if pool_mode */
+
+    /* Load weights for all layers (shared by both pool and dedicated modes) */
+    for (int i = 0; i < num_layers; i++) {
+        LayerMatmulContext* lc = &ctx->layers[i];
 
         /* Load weights for this layer.
          * Try "layers/layer_NN" first (new layout), fall back to "layer_NN". */
@@ -840,9 +884,12 @@ MatmulDecoderContext* matmul_decoder_create(const char* model_dir,
         }
     }
 
-    int total_handles = ctx->n_pool * 3 + num_layers * 7;
-    printf("[MatmulDecoder] Loaded %d layers (qk_norm=%d), NPU handles: %d (pool=%d + B=%d)\n",
-           num_layers, config->has_qk_norm, total_handles, ctx->n_pool * 3, num_layers * 7);
+    int total_handles = (pool_mode == 1)
+        ? ctx->n_pool * 3 + num_layers * 7   /* pool: ctx+A+C shared + per-layer B */
+        : num_layers * 7 * 4;                /* dedicated: ctx+A+B+C per projection */
+    printf("[MatmulDecoder] Loaded %d layers (qk_norm=%d, %s), NPU handles: ~%d\n",
+           num_layers, config->has_qk_norm,
+           pool_mode == 1 ? "pooled" : "dedicated", total_handles);
 
     /* Load final norm weight (model.norm, separate from per-layer norms) */
     snprintf(path, sizeof(path), "%s/final_norm.bin", model_dir);
