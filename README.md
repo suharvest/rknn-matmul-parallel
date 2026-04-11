@@ -24,11 +24,16 @@ Rockchip's RKLLM achieves ~16ms/token on Qwen3-ASR-0.6B, but:
 |--------|-------|--------------|
 | **Performance** | ~16 ms/token | ~16 ms/token |
 | **Open source** | ❌ Closed `librkllmrt.so` | ✅ Full code |
-| **RKNN coexistence** | ❌ Conflicts with RKNN models | ✅ No conflict |
+| **RKNN coexistence** | ❌ Conflicts with RKNN models | ✅ IOMMU domain isolation |
+| **Handle scalability** | ❌ Opaque resource limits | ✅ Context pooling (~211 handles for 28 layers) |
 | **Custom ops** | ❌ Black box | ✅ Full control |
 | **Debuggability** | ❌ Opaque | ✅ Transparent |
 
-**RKLLM has known conflicts when running alongside RKNN models** (e.g., TTS vocoder, ASR encoder). This library provides a conflict-free alternative with equivalent performance.
+**RKLLM has known conflicts when running alongside RKNN models** (e.g., TTS vocoder, ASR encoder). Root causes:
+1. **IOMMU domain contention** — RKLLM and RKNN share domain 0's 4GB address space; overflow causes 6s timeout + EINVAL
+2. **NPU handle limit** — `/dev/rknpu` caps at ~1020 DMA handles per process; a 28-layer decoder naively creates 784
+
+This library solves both: IOMMU domain isolation (`iommu_domain_id=1`) and context pooling (5 shared contexts instead of 196).
 
 ## Performance
 
@@ -50,6 +55,8 @@ Rockchip's RKLLM achieves ~16ms/token on Qwen3-ASR-0.6B, but:
 ## Features
 
 - **Dual NPU core parallelism** via fork + persistent worker processes
+- **IOMMU domain isolation** — runs on separate domain from RKNN models, zero conflict
+- **Context pooling** — 28-layer decoder uses only ~211 NPU handles (vs 784 naive)
 - **Complete decoder stack**: KV cache, RoPE, RMSNorm, attention, FFN, sampling
 - **Multi lm_head support**: multiple output heads per step (e.g., Code Predictor with 15 heads)
 - **Python bindings**: `pip install` and use like RKLLM
