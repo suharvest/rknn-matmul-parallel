@@ -409,6 +409,70 @@ void matmul_kv_cache_destroy(MatmulKVCache* cache) {
     }
 }
 
+/* ─── NEON-optimized GEMV for LM head ─── */
+
+/**
+ * Compute logits = x @ W^T where W is [N, K] row-major (each row is one vocab entry).
+ * x: [K], W: [N, K], out: [N].
+ * Uses NEON vfmaq_f32 for 4-wide FMA, processes 4 output rows at a time.
+ */
+static void gemv_f32_neon(float* out, const float* x, const float* W, int N, int K) {
+    int v = 0;
+
+    /* Process 4 vocab entries at a time */
+    for (; v <= N - 4; v += 4) {
+        float32x4_t acc0 = vdupq_n_f32(0.0f);
+        float32x4_t acc1 = vdupq_n_f32(0.0f);
+        float32x4_t acc2 = vdupq_n_f32(0.0f);
+        float32x4_t acc3 = vdupq_n_f32(0.0f);
+
+        const float* w0 = W + (v + 0) * K;
+        const float* w1 = W + (v + 1) * K;
+        const float* w2 = W + (v + 2) * K;
+        const float* w3 = W + (v + 3) * K;
+
+        int h = 0;
+        for (; h <= K - 4; h += 4) {
+            float32x4_t xv = vld1q_f32(x + h);
+            acc0 = vfmaq_f32(acc0, xv, vld1q_f32(w0 + h));
+            acc1 = vfmaq_f32(acc1, xv, vld1q_f32(w1 + h));
+            acc2 = vfmaq_f32(acc2, xv, vld1q_f32(w2 + h));
+            acc3 = vfmaq_f32(acc3, xv, vld1q_f32(w3 + h));
+        }
+
+        float s0 = vaddvq_f32(acc0);
+        float s1 = vaddvq_f32(acc1);
+        float s2 = vaddvq_f32(acc2);
+        float s3 = vaddvq_f32(acc3);
+
+        /* Scalar tail */
+        for (; h < K; h++) {
+            s0 += x[h] * w0[h];
+            s1 += x[h] * w1[h];
+            s2 += x[h] * w2[h];
+            s3 += x[h] * w3[h];
+        }
+
+        out[v + 0] = s0;
+        out[v + 1] = s1;
+        out[v + 2] = s2;
+        out[v + 3] = s3;
+    }
+
+    /* Remaining vocab entries */
+    for (; v < N; v++) {
+        float32x4_t acc = vdupq_n_f32(0.0f);
+        const float* w = W + v * K;
+        int h = 0;
+        for (; h <= K - 4; h += 4) {
+            acc = vfmaq_f32(acc, vld1q_f32(x + h), vld1q_f32(w + h));
+        }
+        float s = vaddvq_f32(acc);
+        for (; h < K; h++) s += x[h] * w[h];
+        out[v] = s;
+    }
+}
+
 /* ─── RoPE Precompute ─── */
 
 static void precompute_rope_tables(float* cos_table, float* sin_table,
@@ -1039,14 +1103,8 @@ int matmul_decoder_step(MatmulDecoderContext* ctx,
     rms_norm_f32(ctx->normed, ctx->hidden,
                  ctx->final_norm_w, hidden_dim, ctx->config.rms_eps);
 
-    /* LM head: normed @ lm_head^T → logits */
-    for (int v = 0; v < vocab_size; v++) {
-        float sum = 0.0f;
-        for (int h = 0; h < hidden_dim; h++) {
-            sum += ctx->normed[h] * ctx->lm_head[v * hidden_dim + h];
-        }
-        ctx->logits[v] = sum;
-    }
+    /* LM head: normed @ lm_head^T → logits (NEON-optimized GEMV) */
+    gemv_f32_neon(ctx->logits, ctx->normed, ctx->lm_head, vocab_size, hidden_dim);
 
     /* Update KV cache */
     ctx->kv_cache->seq_len++;
@@ -1158,15 +1216,8 @@ int matmul_decoder_step_head(MatmulDecoderContext* ctx,
     rms_norm_f32(ctx->normed, ctx->hidden,
                  ctx->final_norm_w, hidden_dim, ctx->config.rms_eps);
 
-    /* Selected lm_head */
-    const float* head_w = ctx->lm_heads[lm_head_idx];
-    for (int v = 0; v < lm_vocab; v++) {
-        float sum = 0.0f;
-        for (int h = 0; h < hidden_dim; h++) {
-            sum += ctx->normed[h] * head_w[v * hidden_dim + h];
-        }
-        ctx->logits[v] = sum;
-    }
+    /* Selected lm_head (NEON-optimized GEMV) */
+    gemv_f32_neon(ctx->logits, ctx->normed, ctx->lm_heads[lm_head_idx], lm_vocab, hidden_dim);
 
     ctx->kv_cache->seq_len++;
 
