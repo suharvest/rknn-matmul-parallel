@@ -73,6 +73,10 @@ typedef struct {
     PersistentMatmul q_proj;
     PersistentMatmul k_proj;
     PersistentMatmul v_proj;
+    PersistentMatmul qkv_proj;  /* Merged QKV: [hidden, q_dim+kv_dim+kv_dim] */
+    int qkv_merged;             /* 1 = use qkv_proj instead of separate q/k/v */
+    int qkv_q_dim;              /* Output offset: q=[0..q_dim), k=[q_dim..q_dim+kv), v=[q_dim+kv..] */
+    int qkv_kv_dim;
     PersistentMatmul o_proj;
     PersistentMatmul gate_proj;
     PersistentMatmul up_proj;
@@ -135,6 +139,7 @@ struct MatmulDecoderContext {
     float* q_out;               /* [num_q_heads * head_dim] */
     float* k_out;               /* [num_kv_heads * head_dim] */
     float* v_out;               /* [num_kv_heads * head_dim] */
+    float* qkv_out;             /* [q_dim + kv_dim + kv_dim] merged QKV output */
     float* attn_out;            /* [num_q_heads * head_dim] */
     float* ffn_gate;            /* [ffn_dim] */
     float* ffn_up;              /* [ffn_dim] */
@@ -983,9 +988,119 @@ MatmulDecoderContext* matmul_decoder_create(const char* model_dir,
         }
     }
 
+    /* QKV merge disabled: IOMMU domain memory insufficient for 28 extra merged B buffers.
+     * Even INT4 (2MB/layer × 28 = 56MB) exceeds remaining DMA budget after layer + lm_head B.
+     * Savings would be ~6ms (56 fewer rebinds), not worth the memory pressure. */
+    if (0 && pool_mode == 1 && ctx->n_pool < MAX_MATMUL_POOL) {
+        int qkv_q_dim = num_q_heads * head_dim;
+        int qkv_kv_dim = num_kv_heads * head_dim;
+        int qkv_n = qkv_q_dim + qkv_kv_dim + qkv_kv_dim;
+        int is_int4_qkv = (quant_type == QUANT_INT4 || quant_type == QUANT_INT4_G128);
+
+        int qkv_pool = pool_get_or_create(ctx->pool, &ctx->n_pool,
+                                            hidden_dim, qkv_n, quant_type,
+                                            config->iommu_domain_id);
+        if (qkv_pool >= 0) {
+            MatmulPoolEntry* qpe = &ctx->pool[qkv_pool];
+            int ok = 1;
+            for (int i = 0; i < num_layers && ok; i++) {
+                LayerMatmulContext* lc = &ctx->layers[i];
+                int ret = create_pooled_matmul(&lc->qkv_proj, qpe);
+                if (ret != 0) { ok = 0; break; }
+
+                char lpath[512], wp[512];
+                snprintf(lpath, sizeof(lpath), "%s/layers/layer_%02d", model_dir, i);
+                { struct stat st; if (stat(lpath, &st) != 0 || !S_ISDIR(st.st_mode))
+                    snprintf(lpath, sizeof(lpath), "%s/layer_%02d", model_dir, i); }
+
+                if (is_int4_qkv) {
+                    /* Load INT4 packed weights + scales, concat along N */
+                    size_t q_bytes = (size_t)hidden_dim * qkv_q_dim / 2;
+                    size_t kv_bytes = (size_t)hidden_dim * qkv_kv_dim / 2;
+
+                    snprintf(wp, sizeof(wp), "%s/q_proj_weight.bin", lpath);
+                    uint8_t* pq = load_uint8_file(wp, q_bytes);
+                    snprintf(wp, sizeof(wp), "%s/k_proj_weight.bin", lpath);
+                    uint8_t* pk = load_uint8_file(wp, kv_bytes);
+                    snprintf(wp, sizeof(wp), "%s/v_proj_weight.bin", lpath);
+                    uint8_t* pv = load_uint8_file(wp, kv_bytes);
+                    if (!pq || !pk || !pv) { free(pq); free(pk); free(pv); ok = 0; break; }
+
+                    /* Concat packed INT4: [K, q_dim/2] | [K, kv_dim/2] | [K, kv_dim/2] → [K, qkv_n/2] */
+                    size_t merged_bytes = (size_t)hidden_dim * qkv_n / 2;
+                    uint8_t* merged = calloc(merged_bytes, 1);
+                    for (int k = 0; k < hidden_dim; k++) {
+                        memcpy(merged + k * (qkv_n/2),
+                               pq + k * (qkv_q_dim/2), qkv_q_dim/2);
+                        memcpy(merged + k * (qkv_n/2) + qkv_q_dim/2,
+                               pk + k * (qkv_kv_dim/2), qkv_kv_dim/2);
+                        memcpy(merged + k * (qkv_n/2) + qkv_q_dim/2 + qkv_kv_dim/2,
+                               pv + k * (qkv_kv_dim/2), qkv_kv_dim/2);
+                    }
+                    free(pq); free(pk); free(pv);
+
+                    rknn_B_normal_layout_to_native_layout(merged, lc->qkv_proj.mem_B->virt_addr,
+                                                           hidden_dim, qkv_n, &qpe->info);
+                    free(merged);
+
+                    /* Concat scales: [q_scales | k_scales | v_scales] */
+                    snprintf(wp, sizeof(wp), "%s/q_proj_scales.bin", lpath);
+                    float* sq = load_fp32_file(wp, qkv_q_dim);
+                    snprintf(wp, sizeof(wp), "%s/k_proj_scales.bin", lpath);
+                    float* sk = load_fp32_file(wp, qkv_kv_dim);
+                    snprintf(wp, sizeof(wp), "%s/v_proj_scales.bin", lpath);
+                    float* sv = load_fp32_file(wp, qkv_kv_dim);
+
+                    float* merged_scales = calloc(qkv_n, sizeof(float));
+                    if (sq) memcpy(merged_scales, sq, qkv_q_dim * sizeof(float));
+                    if (sk) memcpy(merged_scales + qkv_q_dim, sk, qkv_kv_dim * sizeof(float));
+                    if (sv) memcpy(merged_scales + qkv_q_dim + qkv_kv_dim, sv, qkv_kv_dim * sizeof(float));
+                    lc->qkv_proj.col_scales = merged_scales;
+                    free(sq); free(sk); free(sv);
+                } else {
+                    /* FP16: load .bin files, concat */
+                    snprintf(wp, sizeof(wp), "%s/q_proj.bin", lpath);
+                    int16_t* wq = load_fp16_file(wp, (size_t)hidden_dim * qkv_q_dim);
+                    snprintf(wp, sizeof(wp), "%s/k_proj.bin", lpath);
+                    int16_t* wk = load_fp16_file(wp, (size_t)hidden_dim * qkv_kv_dim);
+                    snprintf(wp, sizeof(wp), "%s/v_proj.bin", lpath);
+                    int16_t* wv = load_fp16_file(wp, (size_t)hidden_dim * qkv_kv_dim);
+                    if (!wq || !wk || !wv) { free(wq); free(wk); free(wv); ok = 0; break; }
+
+                    int16_t* merged = calloc((size_t)hidden_dim * qkv_n, sizeof(int16_t));
+                    for (int k = 0; k < hidden_dim; k++) {
+                        memcpy(merged + k * qkv_n, wq + k * qkv_q_dim, qkv_q_dim * sizeof(int16_t));
+                        memcpy(merged + k * qkv_n + qkv_q_dim, wk + k * qkv_kv_dim, qkv_kv_dim * sizeof(int16_t));
+                        memcpy(merged + k * qkv_n + qkv_q_dim + qkv_kv_dim, wv + k * qkv_kv_dim, qkv_kv_dim * sizeof(int16_t));
+                    }
+                    free(wq); free(wk); free(wv);
+
+                    rknn_B_normal_layout_to_native_layout(merged, lc->qkv_proj.mem_B->virt_addr,
+                                                           hidden_dim, qkv_n, &qpe->info);
+                    free(merged);
+                }
+
+                lc->qkv_merged = 1;
+                lc->qkv_q_dim = qkv_q_dim;
+                lc->qkv_kv_dim = qkv_kv_dim;
+            }
+            if (ok) {
+                printf("[MatmulDecoder] QKV merged (%s): (%d,%d), saves %d rebinds/token\n",
+                       is_int4_qkv ? "INT4" : "FP16", hidden_dim, qkv_n, num_layers * 2);
+            } else {
+                for (int i = 0; i < num_layers; i++) {
+                    ctx->layers[i].qkv_merged = 0;
+                    free(ctx->layers[i].qkv_proj.col_scales);
+                    ctx->layers[i].qkv_proj.col_scales = NULL;
+                }
+                printf("[MatmulDecoder] QKV merge failed, using separate Q/K/V\n");
+            }
+        }
+    }
+
     int total_handles = (pool_mode == 1)
-        ? ctx->n_pool * 3 + num_layers * 7   /* pool: ctx+A+C shared + per-layer B */
-        : num_layers * 7 * 4;                /* dedicated: ctx+A+B+C per projection */
+        ? ctx->n_pool * 3 + num_layers * 7
+        : num_layers * 7 * 4;
     printf("[MatmulDecoder] Loaded %d layers (qk_norm=%d, %s), NPU handles: ~%d\n",
            num_layers, config->has_qk_norm,
            pool_mode == 1 ? "pooled" : "dedicated", total_handles);
@@ -1138,9 +1253,11 @@ MatmulDecoderContext* matmul_decoder_create(const char* model_dir,
     ctx->hidden = aligned_alloc(64, hidden_dim * sizeof(float));
     ctx->residual = aligned_alloc(64, hidden_dim * sizeof(float));
     ctx->normed = aligned_alloc(64, hidden_dim * sizeof(float));
+    int kv_dim = num_kv_heads * head_dim;
     ctx->q_out = aligned_alloc(64, q_dim * sizeof(float));
-    ctx->k_out = aligned_alloc(64, num_kv_heads * head_dim * sizeof(float));
-    ctx->v_out = aligned_alloc(64, num_kv_heads * head_dim * sizeof(float));
+    ctx->k_out = aligned_alloc(64, kv_dim * sizeof(float));
+    ctx->v_out = aligned_alloc(64, kv_dim * sizeof(float));
+    ctx->qkv_out = aligned_alloc(64, (q_dim + kv_dim + kv_dim) * sizeof(float));
     ctx->attn_out = aligned_alloc(64, q_dim * sizeof(float));
     ctx->ffn_gate = aligned_alloc(64, ffn_dim * sizeof(float));
     ctx->ffn_up = aligned_alloc(64, ffn_dim * sizeof(float));
@@ -1319,10 +1436,21 @@ int matmul_decoder_step(MatmulDecoderContext* ctx,
         rms_norm_f32(ctx->normed, ctx->hidden, lc->input_norm_w, hidden_dim, ctx->config.rms_eps);
         _cpu_ops_ms += now_ms() - _cpu_t0;
 
-        /* QKV projections */
-        run_persistent_matmul(&lc->q_proj, ctx->normed, ctx->q_out);
-        run_persistent_matmul(&lc->k_proj, ctx->normed, ctx->k_out);
-        run_persistent_matmul(&lc->v_proj, ctx->normed, ctx->v_out);
+        /* QKV projections (merged or separate) */
+        if (lc->qkv_merged) {
+            run_persistent_matmul(&lc->qkv_proj, ctx->normed, ctx->qkv_out);
+            /* Split merged output: [q_dim | kv_dim | kv_dim] */
+            _cpu_t0 = now_ms();
+            memcpy(ctx->q_out, ctx->qkv_out, lc->qkv_q_dim * sizeof(float));
+            memcpy(ctx->k_out, ctx->qkv_out + lc->qkv_q_dim, lc->qkv_kv_dim * sizeof(float));
+            memcpy(ctx->v_out, ctx->qkv_out + lc->qkv_q_dim + lc->qkv_kv_dim,
+                   lc->qkv_kv_dim * sizeof(float));
+            _cpu_ops_ms += now_ms() - _cpu_t0;
+        } else {
+            run_persistent_matmul(&lc->q_proj, ctx->normed, ctx->q_out);
+            run_persistent_matmul(&lc->k_proj, ctx->normed, ctx->k_out);
+            run_persistent_matmul(&lc->v_proj, ctx->normed, ctx->v_out);
+        }
 
         /* QK norm + RoPE + attention (CPU) */
         _cpu_t0 = now_ms();
@@ -1593,6 +1721,7 @@ void matmul_decoder_destroy(MatmulDecoderContext* ctx) {
             destroy_persistent_matmul(&lc->q_proj);
             destroy_persistent_matmul(&lc->k_proj);
             destroy_persistent_matmul(&lc->v_proj);
+            destroy_persistent_matmul(&lc->qkv_proj);
             destroy_persistent_matmul(&lc->o_proj);
             destroy_persistent_matmul(&lc->gate_proj);
             destroy_persistent_matmul(&lc->up_proj);
@@ -1622,6 +1751,7 @@ void matmul_decoder_destroy(MatmulDecoderContext* ctx) {
     } else if (!ctx->config.tie_word_embeddings) {
         free(ctx->lm_head);
     }
+    free(ctx->qkv_out);
     free(ctx->lm_head_fp16);
     if (ctx->lm_npu_scales) {
         for (int t = 0; t < ctx->lm_npu_n_tiles; t++)
