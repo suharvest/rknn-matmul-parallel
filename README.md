@@ -47,16 +47,53 @@ This library solves both: `iommu_domain_id=1` for isolation, context pooling for
 | FP16 naive (v1) | 461 | no NEON, no NPU lm_head |
 | RKLLM W4A16 (closed) | 43 | compiled NPU graph |
 
-### Optimization Journey (461ms → 82ms)
+### Optimization Journey (461ms → 82ms, 5.6× speedup)
+
+<details>
+<summary>Full optimization history with technical details</summary>
+
+#### Phase 1: Make It Work
+
+| Step | What | Impact |
+|------|------|--------|
+| Context pooling | 196 per-layer contexts → 5 shared pools, B rebind per matmul | Handle count 784→211, bypasses `/dev/rknpu` 1020 limit |
+| IOMMU domain isolation | `iommu_domain_id=1` separates matmul from RKNN models | Eliminates 6s timeout EINVAL from domain 0 contention |
+| B native layout conversion | `rknn_B_normal_layout_to_native_layout` with separate in/out buffers | In-place conversion corrupted weights silently |
+| FP16→FP32 output | RK3576 NPU doesn't support `FLOAT16_TO_FLOAT16` | Changed to `FLOAT16_TO_FLOAT32`, fixed output read path |
+| W4A16 per-column scales | NPU INT4 uses per-layer scale; CPU applies per-column scales post-matmul | NEON-fused FP16→FP32 × scale in one pass |
+
+#### Phase 2: Make It Correct
+
+| Step | What | Impact |
+|------|------|--------|
+| attn_out buffer overflow | Allocated `hidden_dim` (1024) but attention writes `q_dim` (2048) | Heap corruption → malloc crash after few steps |
+| Residual connection fix | `o_proj` was overwriting original hidden before residual add | Every token's output was wrong |
+| GQA attention fix | K/V cache indexing ignored `kv_head` offset | All 16 Q heads attended to KV head 0 only |
+| Final norm weight | Was using last layer's post_attn_norm instead of dedicated `final_norm.bin` | Wrong normalization before lm_head |
+| RoPE interleaved mode | Was using split-half (GPT-NeoX) instead of interleaved (Qwen3/LLaMA) | Completely broken attention scores |
+| KV cache bounds check | No check for `seq_len >= max_seq_len` | Silent buffer overflow |
+
+#### Phase 3: Make It Fast
+
+| Step | ms/token | Technique |
+|------|----------|-----------|
+| Baseline | 461 | Naive C loops, CPU lm_head |
+| + NEON GEMV for lm_head | 335 | 4-wide FMA, 4 vocab entries per iteration |
+| + FP16 GEMV | 259 | FP16 weights halve memory bandwidth |
+| + W4A16 layer quantization | 167 | INT4 matmul 2.7× faster than FP16 on NPU |
+| + NPU tiled lm_head | 125 | 38 tiles × (1024,4096), reuse pool context |
+| + INT4 lm_head quantization | **82** | Per-column INT4 quantized at init, scales applied via NEON |
+
+</details>
+
+**Summary:**
 
 | Optimization | ms/token | Improvement |
 |-------------|----------|-------------|
-| Baseline (naive CPU lm_head) | 461 | — |
-| + NEON GEMV | 335 | -27% |
-| + Destroy fix + stable pool | 280 | -16% |
-| + W4A16 quantization | 167 | -40% |
-| + NPU tiled lm_head (FP16) | 125 | -25% |
-| + NPU lm_head INT4 | **82** | **-34%** |
+| Baseline | 461 | — |
+| + ARM NEON CPU ops | 335 | -27% |
+| + W4A16 quantization | 167 | -50% |
+| + NPU tiled lm_head (INT4) | **82** | **-51%** |
 
 ### Why 82ms vs RKLLM 43ms?
 
