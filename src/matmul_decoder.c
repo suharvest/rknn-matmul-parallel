@@ -36,6 +36,7 @@ typedef struct {
     int K, N;
     int initialized;
     int is_pooled;          /* 1 = ctx/A/C are shared, only destroy B */
+    rknn_matmul_info* pool_info;  /* Points to pool's info (for B layout conversion) */
 } PersistentMatmul;
 
 /**
@@ -44,6 +45,7 @@ typedef struct {
  */
 typedef struct {
     rknn_matmul_ctx ctx;
+    rknn_matmul_info info;      /* Saved for B layout conversion */
     rknn_matmul_io_attr io;
     rknn_tensor_mem* mem_A;
     rknn_tensor_mem* mem_C;
@@ -168,6 +170,8 @@ static int pool_get_or_create(MatmulPoolEntry* pool, int* n_pool,
     info.B_layout = 1;
     info.iommu_domain_id = iommu_domain_id;
 
+    pe->info = info;  /* Save for B layout conversion */
+
     int ret = rknn_matmul_create(&pe->ctx, &info, &pe->io);
     if (ret != 0) {
         fprintf(stderr, "[Pool] rknn_matmul_create(%d,%d) failed: %d\n", K, N, ret);
@@ -219,6 +223,7 @@ static int create_pooled_matmul(PersistentMatmul* pm, MatmulPoolEntry* pe) {
     pm->N = pe->N;
     pm->initialized = 1;
     pm->is_pooled = 1;
+    pm->pool_info = &pe->info;
 
     return MATMUL_DECODER_OK;
 }
@@ -541,7 +546,8 @@ static int load_layer_weights(LayerMatmulContext* lc, const char* layer_dir,
                 int16_t* fp16_data = load_fp16_file(path, (size_t)K * N);
                 if (fp16_data) {
                     memcpy(pm->mem_B->virt_addr, fp16_data, K * N * sizeof(int16_t));
-                    rknn_B_normal_layout_to_native_layout(pm->ctx, pm->mem_B, &pm->io.B);
+                    rknn_B_normal_layout_to_native_layout(pm->mem_B->virt_addr, pm->mem_B->virt_addr,
+                                                         pm->K, pm->N, pm->pool_info);
                     free(fp16_data);
                     continue;
                 }
@@ -558,7 +564,8 @@ static int load_layer_weights(LayerMatmulContext* lc, const char* layer_dir,
 
             /* Copy packed weights to B memory and convert to native layout */
             memcpy(pm->mem_B->virt_addr, w_data, (size_t)N * K / 2);
-            rknn_B_normal_layout_to_native_layout(pm->ctx, pm->mem_B, &pm->io.B);
+            rknn_B_normal_layout_to_native_layout(pm->mem_B->virt_addr, pm->mem_B->virt_addr,
+                                                     pm->K, pm->N, pm->pool_info);
 
             free(w_data);
             free(scales);
@@ -572,7 +579,8 @@ static int load_layer_weights(LayerMatmulContext* lc, const char* layer_dir,
             }
 
             memcpy(pm->mem_B->virt_addr, w_data, K * N * sizeof(int16_t));
-            rknn_B_normal_layout_to_native_layout(pm->ctx, pm->mem_B, &pm->io.B);
+            rknn_B_normal_layout_to_native_layout(pm->mem_B->virt_addr, pm->mem_B->virt_addr,
+                                                     pm->K, pm->N, pm->pool_info);
             free(w_data);
         }
     }
