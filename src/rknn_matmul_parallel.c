@@ -64,8 +64,8 @@ typedef struct {
     int B_layout;
 
     /* Data buffers */
-    int16_t* input_buffer;    /* [M * K] */
-    int16_t* output_buffer;   /* [M * N] - workers write to their slice */
+    int16_t* input_buffer;    /* [M * K] FP16 */
+    float* output_buffer;     /* [M * N] FP32 - workers write to their slice */
     int16_t* weight_buffers[RMP_MAX_WORKERS];  /* [K * N_half] per worker */
     size_t input_size;
     size_t output_size_per_worker;
@@ -102,9 +102,7 @@ static rknn_matmul_type to_rknn_type(RmpMatmulType type) {
     switch (type) {
         case RMP_TYPE_FP16_INT4: return RKNN_FLOAT16_MM_INT4_TO_FLOAT16;
         case RMP_TYPE_FP16_INT8: return RKNN_FLOAT16_MM_INT8_TO_FLOAT16;
-        /* RK3576 doesn't support FP16→FP16, must use FP16→FP32.
-         * NOTE: output buffer is still int16_t* in rmp_run API.
-         * TODO: adapt rmp_run to handle FP32 output when type is FP16_FP16 */
+        /* RK3576 doesn't support FP16→FP16, use FP16→FP32 */
         default: return RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32;
     }
 }
@@ -166,10 +164,11 @@ static void* worker_thread_func(void* arg) {
         /* Execute matmul on NPU (blocks this thread, other thread runs on other core) */
         rknn_matmul_run(ws->ctx);
 
-        /* Copy output to shared buffer (write to our slice) */
-        int output_offset = worker_id * shm->output_size_per_worker;
-        memcpy(shm->output_buffer + output_offset, ws->mem_C->virt_addr,
-               ws->io_attr.C.size);
+        /* Copy output to shared buffer (write to our slice).
+         * C is FP32 for FLOAT16_TO_FLOAT32, FP16 for INT4/INT8 types. */
+        size_t out_offset = (size_t)worker_id * shm->M * ws->N_half;
+        memcpy(shm->output_buffer + out_offset, ws->mem_C->virt_addr,
+               shm->M * ws->N_half * sizeof(float));
 
         /* Signal completion */
         pthread_mutex_lock(&shm->mutex);
@@ -234,9 +233,9 @@ RmpContext* rmp_create(const RmpConfig* config, const void* weights, const float
 
     /* Allocate data buffers */
     shm->input_buffer = malloc(config->M * config->K * sizeof(int16_t));
-    shm->output_buffer = malloc(config->M * config->N * sizeof(int16_t));
+    shm->output_buffer = malloc(config->M * config->N * sizeof(float));
     shm->input_size = config->M * config->K * sizeof(int16_t);
-    shm->output_size_per_worker = config->M * N_half * sizeof(int16_t);
+    shm->output_size_per_worker = config->M * N_half * sizeof(float);
 
     /* Split weights for each worker */
     for (int i = 0; i < n_workers; i++) {
@@ -301,7 +300,7 @@ RmpContext* rmp_create(const RmpConfig* config, const void* weights, const float
     return ctx;
 }
 
-int rmp_run(RmpContext* ctx, const int16_t* input, int16_t* output) {
+int rmp_run(RmpContext* ctx, const int16_t* input, float* output) {
     if (!ctx || !input || !output) return -1;
 
     SharedState* shm = ctx->shm;
@@ -332,8 +331,8 @@ int rmp_run(RmpContext* ctx, const int16_t* input, int16_t* output) {
     }
     pthread_mutex_unlock(&shm->mutex);
 
-    /* Copy output from shared buffer */
-    memcpy(output, shm->output_buffer, ctx->config.M * ctx->config.N * sizeof(int16_t));
+    /* Copy output from shared buffer (FP32) */
+    memcpy(output, shm->output_buffer, ctx->config.M * ctx->config.N * sizeof(float));
 
     return 0;
 }

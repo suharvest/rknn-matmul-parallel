@@ -26,9 +26,11 @@ extern "C" {
 /* Maximum number of parallel workers (RK3576/RK3588 have 2 NPU cores) */
 #define RMP_MAX_WORKERS 2
 
-/* Matmul precision types */
+/* Matmul precision types
+ * Note: RK3576 NPU does not support FP16→FP16 output.
+ * All types produce FP32 output. */
 typedef enum {
-    RMP_TYPE_FP16_FP16 = 0,    /* FP16 input x FP16 weight -> FP16 output */
+    RMP_TYPE_FP16_FP16 = 0,    /* FP16 input x FP16 weight -> FP32 output */
     RMP_TYPE_FP16_INT4 = 1,    /* FP16 input x INT4 weight -> FP16 output */
     RMP_TYPE_FP16_INT8 = 2,    /* FP16 input x INT8 weight -> FP16 output */
 } RmpMatmulType;
@@ -77,10 +79,10 @@ RmpContext* rmp_create(const RmpConfig* config, const void* weights, const float
  *
  * @param ctx       Context from rmp_create()
  * @param input     Input matrix (M x K, FP16)
- * @param output    Output matrix (M x N, FP16)
+ * @param output    Output matrix (M x N, FP32)
  * @return          0 on success, negative on error
  */
-int rmp_run(RmpContext* ctx, const int16_t* input, int16_t* output);
+int rmp_run(RmpContext* ctx, const int16_t* input, float* output);
 
 /**
  * Destroy context and cleanup worker processes.
