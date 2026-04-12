@@ -161,8 +161,16 @@ static rknn_matmul_type quant_to_rknn_type(QuantizationType quant_type) {
     switch (quant_type) {
         case QUANT_FP16:     return RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32;
         case QUANT_INT4:
-        case QUANT_INT4_G128: return RKNN_FLOAT16_MM_INT4_TO_FLOAT16;
-        case QUANT_INT8:     return RKNN_FLOAT16_MM_INT8_TO_FLOAT16;
+        case QUANT_INT4_G128:
+            /* INT4 matmul (type 7/8) has a known NPU kernel bug on librknnrt 2.3.2:
+             * positive INT4 values lose ~50% magnitude, producing garbage output.
+             * See: https://github.com/airockchip/rknn-toolkit2/pull/412 */
+            fprintf(stderr, "[MatmulDecoder] ERROR: INT4 quantization is not supported — "
+                    "RKNN NPU INT4 matmul kernel has a known bug on librknnrt 2.3.x "
+                    "(positive values lose ~50%% magnitude). "
+                    "Use quant_type='fp16' or 'int8' instead.\n");
+            return (rknn_matmul_type)-1;  /* Signal error */
+        case QUANT_INT8:     return RKNN_FLOAT16_MM_INT8_TO_FLOAT32;
         default:             return RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32;
     }
 }
@@ -253,7 +261,9 @@ static int create_pooled_matmul(PersistentMatmul* pm, MatmulPoolEntry* pe) {
     pm->N = pe->N;
     pm->initialized = 1;
     pm->is_pooled = 1;
-    pm->output_is_fp32 = (pe->info.type == RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32);
+    pm->output_is_fp32 = (pe->info.type == RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32 ||
+                          pe->info.type == RKNN_FLOAT16_MM_INT8_TO_FLOAT32 ||
+                          pe->info.type == RKNN_FLOAT16_MM_INT4_TO_FLOAT32);
     pm->pool_info = &pe->info;
 
     return MATMUL_DECODER_OK;
@@ -298,7 +308,9 @@ static int create_persistent_matmul(PersistentMatmul* pm, int M, int K, int N,
     pm->N = N;
     pm->initialized = 1;
     pm->is_pooled = 0;
-    pm->output_is_fp32 = (info.type == RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32);
+    pm->output_is_fp32 = (info.type == RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32 ||
+                          info.type == RKNN_FLOAT16_MM_INT8_TO_FLOAT32 ||
+                          info.type == RKNN_FLOAT16_MM_INT4_TO_FLOAT32);
     /* Store info for B layout conversion (dedicated mode has no pool) */
     pm->_own_info = info;
     pm->pool_info = &pm->_own_info;
@@ -372,11 +384,26 @@ static int run_persistent_matmul(PersistentMatmul* pm, const float* input_fp32, 
         return MATMUL_DECODER_ERR_RKNN;
     }
 
-    /* Read output and apply per-column scales if W4A16 */
+    /* Read output and apply per-column scales if quantized */
     t0 = now_ms();
-    if (pm->output_is_fp32) {
+    if (pm->output_is_fp32 && pm->col_scales) {
+        /* FP32 output + per-column scales (e.g., INT8→FP32 with external scales) */
+        const float* src = (const float*)pm->mem_C->virt_addr;
+        const float* scales = pm->col_scales;
+        int i;
+        for (i = 0; i <= N - 4; i += 4) {
+            float32x4_t f = vld1q_f32(src + i);
+            float32x4_t s = vld1q_f32(scales + i);
+            vst1q_f32(output_fp32 + i, vmulq_f32(f, s));
+        }
+        for (; i < N; i++) {
+            output_fp32[i] = src[i] * scales[i];
+        }
+    } else if (pm->output_is_fp32) {
+        /* FP32 output, no scales (e.g., FP16→FP32) */
         memcpy(output_fp32, pm->mem_C->virt_addr, N * sizeof(float));
     } else if (pm->col_scales) {
+        /* FP16 output + per-column scales (e.g., INT4→FP16 with external scales) */
         const int16_t* src = (const int16_t*)pm->mem_C->virt_addr;
         const float* scales = pm->col_scales;
         int i;
@@ -390,6 +417,7 @@ static int run_persistent_matmul(PersistentMatmul* pm, const float* input_fp32, 
             output_fp32[i] = (float)(*(const __fp16*)(src + i)) * scales[i];
         }
     } else {
+        /* FP16 output, no scales */
         vec_fp16_to_fp32(output_fp32, (int16_t*)pm->mem_C->virt_addr, N);
     }
     _acc_convert_ms += now_ms() - t0;
@@ -1120,13 +1148,16 @@ MatmulDecoderContext* matmul_decoder_create(const char* model_dir,
         printf("[MatmulDecoder] Loaded final_norm weight\n");
     }
 
-    /* NPU-tiled lm_head with INT4 quantization.
-     * Quantize FP16 lm_head → INT4 at init, use per-column scales at runtime.
-     * Separate from layer projections (which may be FP16 or INT4 independently). */
+    /* NPU-tiled lm_head with INT8 quantization.
+     * Quantize FP16 lm_head → INT8 at init, use per-column scales at runtime.
+     * Uses FLOAT16_MM_INT8_TO_FLOAT32 (type=5) which is reliable on all tested
+     * librknnrt versions. INT4 (type=7/8) has a known NPU kernel bug on 2.3.2
+     * (positive values lose ~50% magnitude). */
     ctx->lm_npu_n_tiles = 0;
     ctx->lm_npu_is_int4 = 0;
     ctx->lm_npu_scales = NULL;
-    if (ctx->lm_head_fp16 && n_lm <= 1 && ctx->n_pool < MAX_MATMUL_POOL) {
+    if (!config->disable_npu_lm_head &&
+        ctx->lm_head_fp16 && n_lm <= 1 && ctx->n_pool < MAX_MATMUL_POOL) {
         int tile_n = 4096;
         int n_tiles = (vocab_size + tile_n - 1) / tile_n;
         int lm_pool_idx = ctx->n_pool++;
@@ -1138,7 +1169,7 @@ MatmulDecoderContext* matmul_decoder_create(const char* model_dir,
         lm_info.M = 1;
         lm_info.K = hidden_dim;
         lm_info.N = tile_n;
-        lm_info.type = RKNN_FLOAT16_MM_INT4_TO_FLOAT16;
+        lm_info.type = RKNN_FLOAT16_MM_INT8_TO_FLOAT32;
         lm_info.B_layout = 1;
         lm_info.iommu_domain_id = config->iommu_domain_id;
         pe->info = lm_info;
@@ -1168,12 +1199,11 @@ MatmulDecoderContext* matmul_decoder_create(const char* model_dir,
                 const int16_t* src_fp16 = ctx->lm_head_fp16 + (size_t)v_start * hidden_dim;
                 for (int k = 0; k < hidden_dim; k++) {
                     for (int n = 0; n < v_count; n++) {
-                        /* FP16 → FP32 manual conversion */
                         transposed[k * tile_n + n] = (float)(*(const __fp16*)(src_fp16 + n * hidden_dim + k));
                     }
                 }
 
-                /* Per-column INT4 quantization: scale = max(|col|) / 7 */
+                /* Per-column INT8 quantization: scale = max(|col|) / 127 */
                 float* scales = calloc(tile_n, sizeof(float));
                 ctx->lm_npu_scales[t] = scales;
                 int8_t* quantized = calloc((size_t)hidden_dim * tile_n, sizeof(int8_t));
@@ -1184,30 +1214,19 @@ MatmulDecoderContext* matmul_decoder_create(const char* model_dir,
                         float v = fabsf(transposed[k * tile_n + n]);
                         if (v > col_max) col_max = v;
                     }
-                    scales[n] = col_max / 7.0f;
-                    float inv_scale = (col_max > 0) ? 7.0f / col_max : 0;
+                    scales[n] = col_max / 127.0f;
+                    float inv_scale = (col_max > 0) ? 127.0f / col_max : 0;
                     for (int k = 0; k < hidden_dim; k++) {
                         int q = (int)roundf(transposed[k * tile_n + n] * inv_scale);
-                        if (q < -8) q = -8;
-                        if (q > 7) q = 7;
+                        if (q < -128) q = -128;
+                        if (q > 127) q = 127;
                         quantized[k * tile_n + n] = (int8_t)q;
                     }
                 }
 
-                /* Pack INT4: two values per byte (lo/hi nibble), [K, N/2] */
-                uint8_t* packed = calloc((size_t)hidden_dim * tile_n / 2, 1);
-                for (int k = 0; k < hidden_dim; k++) {
-                    for (int n = 0; n < tile_n; n += 2) {
-                        int8_t lo = quantized[k * tile_n + n];
-                        int8_t hi = (n + 1 < tile_n) ? quantized[k * tile_n + n + 1] : 0;
-                        packed[k * (tile_n / 2) + n / 2] = ((uint8_t)(lo & 0xF)) | ((uint8_t)(hi & 0xF) << 4);
-                    }
-                }
-
-                /* Convert packed INT4 to native layout */
-                rknn_B_normal_layout_to_native_layout(packed, ctx->lm_npu_B[t]->virt_addr,
+                /* Convert INT8 to native layout (no nibble packing needed) */
+                rknn_B_normal_layout_to_native_layout(quantized, ctx->lm_npu_B[t]->virt_addr,
                                                        hidden_dim, tile_n, &pe->info);
-                free(packed);
                 free(quantized);
                 free(transposed);
             }
@@ -1216,8 +1235,8 @@ MatmulDecoderContext* matmul_decoder_create(const char* model_dir,
                 ctx->lm_npu_n_tiles = n_tiles;
                 ctx->lm_npu_tile_n = tile_n;
                 ctx->lm_npu_pool_idx = lm_pool_idx;
-                ctx->lm_npu_is_int4 = 1;
-                printf("[MatmulDecoder] NPU lm_head INT4: %d tiles × (%d,%d), pool[%d]\n",
+                ctx->lm_npu_is_int4 = 0;  /* INT8 output is FP32, no FP16→FP32 conversion needed */
+                printf("[MatmulDecoder] NPU lm_head INT8: %d tiles × (%d,%d), pool[%d]\n",
                        n_tiles, hidden_dim, tile_n, lm_pool_idx);
             } else {
                 for (int t = 0; t < n_tiles; t++) {
@@ -1228,7 +1247,7 @@ MatmulDecoderContext* matmul_decoder_create(const char* model_dir,
                 free(ctx->lm_npu_B); ctx->lm_npu_B = NULL;
                 free(ctx->lm_npu_scales); ctx->lm_npu_scales = NULL;
                 ctx->n_pool--;
-                printf("[MatmulDecoder] NPU lm_head INT4 failed\n");
+                printf("[MatmulDecoder] NPU lm_head INT8 failed\n");
             }
         } else {
             ctx->n_pool--;
@@ -1531,23 +1550,22 @@ int matmul_decoder_step(MatmulDecoderContext* ctx,
             int v_count = tile_n;
             if (v_start + v_count > vocab_size) v_count = vocab_size - v_start;
 
-            if (ctx->lm_npu_is_int4 && ctx->lm_npu_scales && ctx->lm_npu_scales[t]) {
-                /* INT4→FP16 output: convert to FP32 and apply per-column scales */
-                const int16_t* c_fp16 = (const int16_t*)pe->mem_C->virt_addr;
+            if (ctx->lm_npu_scales && ctx->lm_npu_scales[t]) {
+                /* INT8→FP32 output: apply per-column scales */
+                const float* c_fp32 = (const float*)pe->mem_C->virt_addr;
                 const float* scales = ctx->lm_npu_scales[t];
                 float* dst = ctx->logits + v_start;
                 int n = 0;
                 for (; n <= v_count - 4; n += 4) {
-                    float16x4_t h = vld1_f16((const __fp16*)(c_fp16 + n));
-                    float32x4_t f = vcvt_f32_f16(h);
+                    float32x4_t f = vld1q_f32(c_fp32 + n);
                     float32x4_t s = vld1q_f32(scales + n);
                     vst1q_f32(dst + n, vmulq_f32(f, s));
                 }
                 for (; n < v_count; n++) {
-                    dst[n] = (float)(*(const __fp16*)(c_fp16 + n)) * scales[n];
+                    dst[n] = c_fp32[n] * scales[n];
                 }
             } else {
-                /* FP16→FP32 output: direct copy */
+                /* FP32 output, no scales */
                 memcpy(ctx->logits + v_start, pe->mem_C->virt_addr, v_count * sizeof(float));
             }
         }

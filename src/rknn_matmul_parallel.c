@@ -101,7 +101,7 @@ struct RmpContext {
 static rknn_matmul_type to_rknn_type(RmpMatmulType type) {
     switch (type) {
         case RMP_TYPE_FP16_INT4: return RKNN_FLOAT16_MM_INT4_TO_FLOAT16;
-        case RMP_TYPE_FP16_INT8: return RKNN_FLOAT16_MM_INT8_TO_FLOAT16;
+        case RMP_TYPE_FP16_INT8: return RKNN_FLOAT16_MM_INT8_TO_FLOAT32;
         /* RK3576 doesn't support FP16→FP16, use FP16→FP32 */
         default: return RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32;
     }

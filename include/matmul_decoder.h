@@ -100,6 +100,11 @@ typedef struct {
 
     /* Execution mode */
     ExecutionMode exec_mode;    /* Single or dual NPU core */
+
+    /* Disable NPU-accelerated lm_head (fall back to CPU FP16 GEMV).
+     * Useful when INT4 NPU lm_head causes unacceptable precision loss.
+     * 0 = auto (use NPU if available), 1 = force CPU lm_head */
+    int disable_npu_lm_head;
 } MatmulDecoderConfig;
 
 /**

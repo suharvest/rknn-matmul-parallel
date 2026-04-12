@@ -22,7 +22,8 @@ public:
     PyMatmulDecoder(const std::string& model_dir,
                     int max_seq_len = 4096,
                     const std::string& quant_type = "int4",
-                    const std::string& exec_mode = "dual_core")
+                    const std::string& exec_mode = "dual_core",
+                    bool disable_npu_lm_head = false)
         : ctx_(nullptr), max_seq_len_(max_seq_len) {
 
         QuantizationType quant = QUANT_INT4;
@@ -40,6 +41,7 @@ public:
         }
         config.exec_mode = exec;
         config.max_seq_len = max_seq_len;
+        config.disable_npu_lm_head = disable_npu_lm_head ? 1 : 0;
 
         ctx_ = matmul_decoder_create(model_dir.c_str(), &config, quant, max_seq_len);
         if (!ctx_) {
@@ -250,11 +252,12 @@ PYBIND11_MODULE(matmul_decoder, m) {
     m.doc() = "Generic Matmul Decoder for RK3576 NPU";
 
     py::class_<PyMatmulDecoder>(m, "MatmulDecoder")
-        .def(py::init<const std::string&, int, const std::string&, const std::string&>(),
+        .def(py::init<const std::string&, int, const std::string&, const std::string&, bool>(),
              py::arg("model_dir"),
              py::arg("max_seq_len") = 4096,
              py::arg("quant_type") = "int4",
-             py::arg("exec_mode") = "dual_core")
+             py::arg("exec_mode") = "dual_core",
+             py::arg("disable_npu_lm_head") = false)
 
         .def("step", &PyMatmulDecoder::step,
              py::arg("token_id"),

@@ -328,9 +328,9 @@ python3 tests/benchmark.py --model-dir /path/to/weights --quant-type int4
 
 ## Known Limitations
 
-- **B rebind overhead**: Context pooling requires rebinding B weights per matmul (24ms/token for 28 layers). This is an RKNN matmul API limitation.
+- **INT4 quantization not supported on librknnrt 2.3.x**: The RKNN NPU INT4 matmul kernel (`RKNN_FLOAT16_MM_INT4_TO_FLOAT16/FLOAT32`, type 7/8) has a confirmed bug — positive INT4 values lose ~50% magnitude, producing garbage output for dense matrices. See [airockchip/rknn-toolkit2#412](https://github.com/airockchip/rknn-toolkit2/pull/412). Use `quant_type="fp16"` or `"int8"` instead. Requesting INT4 will print an error and fail to initialize.
+- **B rebind overhead**: Context pooling requires rebinding B weights per matmul (~24ms/token for 28 layers). This is an RKNN matmul API limitation.
 - **IOMMU memory budget**: ~211 DMA handles for 28 layers + 38 lm_head tiles. QKV merge (combining 3 projections into 1) exceeds budget on 8GB devices.
-- **INT4 lm_head precision**: Per-column INT4 quantization of the 151936-vocab projection causes minor rank changes in top-1 predictions (cosine>0.998, top-5 overlap maintained).
 
 ## License
 

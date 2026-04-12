@@ -15,7 +15,9 @@ CXXFLAGS = -O3 -Wall -Wextra -fPIC -std=c++17
 
 # RKNN SDK path (set externally or use default)
 RKNN_SDK_PATH ?= /opt/rknn-toolkit2/rknpu2/runtime/Linux
-INCLUDES = -I./include -I$(RKNN_SDK_PATH)/include
+# RKNN_INCLUDE_PATH: override to use real SDK headers (e.g., from rk3576-tts-build/engine/include)
+RKNN_INCLUDE_PATH ?= $(RKNN_SDK_PATH)/include
+INCLUDES = -I./include -I$(RKNN_INCLUDE_PATH)
 LDFLAGS = -L$(RKNN_SDK_PATH)/lib -lrknnrt -lpthread -lm
 
 # Python binding
