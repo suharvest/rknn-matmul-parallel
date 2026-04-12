@@ -405,6 +405,171 @@ void vec_fp16_to_fp32(float* dst, const int16_t* src, int n) {
     }
 }
 
+/* ─── Batch Operations (for batch prefill) ─── */
+
+void rms_norm_batch_f32(float* out, const float* x, const float* weight,
+                         int M, int dim, float eps) {
+    for (int t = 0; t < M; t++) {
+        rms_norm_f32(out + t * dim, x + t * dim, weight, dim, eps);
+    }
+}
+
+void apply_rope_batch_f32(float* x, int M, int start_pos,
+                           int num_heads, int head_dim, float rope_theta, int rope_style) {
+    int half = head_dim / 2;
+    int head_stride = num_heads * head_dim;
+
+    /* Precompute cos/sin for positions [start_pos, start_pos + M) */
+    float* cos_buf = (float*)malloc(M * half * sizeof(float));
+    float* sin_buf = (float*)malloc(M * half * sizeof(float));
+
+    for (int t = 0; t < M; t++) {
+        int pos = start_pos + t;
+        for (int i = 0; i < half; i++) {
+            float freq = 1.0f / powf(rope_theta, (2.0f * i) / head_dim);
+            float angle = pos * freq;
+            cos_buf[t * half + i] = cosf(angle);
+            sin_buf[t * half + i] = sinf(angle);
+        }
+    }
+
+    for (int t = 0; t < M; t++) {
+        apply_rope_f32(x + t * head_stride,
+                       cos_buf + t * half,
+                       sin_buf + t * half,
+                       num_heads, head_dim, rope_style);
+    }
+
+    free(cos_buf);
+    free(sin_buf);
+}
+
+void silu_mul_batch_f32(float* out, const float* gate, const float* up, int M, int dim) {
+    for (int t = 0; t < M; t++) {
+        silu_mul_f32(out + t * dim, gate + t * dim, up + t * dim, dim);
+    }
+}
+
+void vec_add_batch_f32(float* dst, const float* src, int M, int dim) {
+    for (int t = 0; t < M; t++) {
+        vec_add_f32(dst + t * dim, src + t * dim, dim);
+    }
+}
+
+void attention_batch_causal_f32(
+    float* out,
+    const float* q_batch,
+    const float* k_batch,
+    const float* v_batch,
+    const float* k_cache,
+    const float* v_cache,
+    int M, int num_q_heads, int num_kv_heads, int head_dim,
+    int cache_seq_len) {
+
+    float scale = 1.0f / sqrtf((float)head_dim);
+    int groups = num_q_heads / num_kv_heads;
+    int kv_stride = num_kv_heads * head_dim;  /* stride between positions in cache & batch */
+    int q_stride = num_q_heads * head_dim;    /* stride between tokens in Q/out batch */
+
+    /* Max attention length = cache_seq_len + M */
+    int max_attn_len = cache_seq_len + M;
+    float* scores = (float*)malloc(max_attn_len * sizeof(float));
+
+    for (int t = 0; t < M; t++) {
+        int attn_len = cache_seq_len + t + 1;  /* causal: attend to cache + batch[0..t] */
+
+        for (int h = 0; h < num_q_heads; h++) {
+            int kv_h = h / groups;
+            const float* qh = q_batch + t * q_stride + h * head_dim;
+
+            /* Compute attention scores: Q[t,h] · K[s,kv_h] */
+            float max_score = -1e30f;
+
+            /* Scores from KV cache [0, cache_seq_len) */
+            for (int s = 0; s < cache_seq_len; s++) {
+                const float* ks = k_cache + s * kv_stride + kv_h * head_dim;
+                float dot = 0.0f;
+                int d;
+                for (d = 0; d <= head_dim - 4; d += 4) {
+                    float32x4_t qv = vld1q_f32(qh + d);
+                    float32x4_t kv = vld1q_f32(ks + d);
+                    dot += vaddvq_f32(vmulq_f32(qv, kv));
+                }
+                for (; d < head_dim; d++) {
+                    dot += qh[d] * ks[d];
+                }
+                scores[s] = dot * scale;
+                if (scores[s] > max_score) max_score = scores[s];
+            }
+
+            /* Scores from batch tokens [0, t] (inclusive, causal) */
+            for (int bt = 0; bt <= t; bt++) {
+                const float* ks = k_batch + bt * kv_stride + kv_h * head_dim;
+                float dot = 0.0f;
+                int d;
+                for (d = 0; d <= head_dim - 4; d += 4) {
+                    float32x4_t qv = vld1q_f32(qh + d);
+                    float32x4_t kv = vld1q_f32(ks + d);
+                    dot += vaddvq_f32(vmulq_f32(qv, kv));
+                }
+                for (; d < head_dim; d++) {
+                    dot += qh[d] * ks[d];
+                }
+                scores[cache_seq_len + bt] = dot * scale;
+                if (scores[cache_seq_len + bt] > max_score)
+                    max_score = scores[cache_seq_len + bt];
+            }
+
+            /* Softmax over [0, attn_len) */
+            float sum = 0.0f;
+            for (int s = 0; s < attn_len; s++) {
+                scores[s] = expf(scores[s] - max_score);
+                sum += scores[s];
+            }
+            float inv_sum = 1.0f / sum;
+            for (int s = 0; s < attn_len; s++) {
+                scores[s] *= inv_sum;
+            }
+
+            /* Compute output: scores @ V */
+            float* oh = out + t * q_stride + h * head_dim;
+            memset(oh, 0, head_dim * sizeof(float));
+
+            /* V from cache */
+            for (int s = 0; s < cache_seq_len; s++) {
+                const float* vs = v_cache + s * kv_stride + kv_h * head_dim;
+                float sc = scores[s];
+                int d;
+                for (d = 0; d <= head_dim - 4; d += 4) {
+                    float32x4_t acc = vld1q_f32(oh + d);
+                    float32x4_t vv = vld1q_f32(vs + d);
+                    vst1q_f32(oh + d, vmlaq_n_f32(acc, vv, sc));
+                }
+                for (; d < head_dim; d++) {
+                    oh[d] += sc * vs[d];
+                }
+            }
+
+            /* V from batch */
+            for (int bt = 0; bt <= t; bt++) {
+                const float* vs = v_batch + bt * kv_stride + kv_h * head_dim;
+                float sc = scores[cache_seq_len + bt];
+                int d;
+                for (d = 0; d <= head_dim - 4; d += 4) {
+                    float32x4_t acc = vld1q_f32(oh + d);
+                    float32x4_t vv = vld1q_f32(vs + d);
+                    vst1q_f32(oh + d, vmlaq_n_f32(acc, vv, sc));
+                }
+                for (; d < head_dim; d++) {
+                    oh[d] += sc * vs[d];
+                }
+            }
+        }
+    }
+
+    free(scores);
+}
+
 /* ─── Sampling ─── */
 
 int argmax_f32(const float* x, int n) {

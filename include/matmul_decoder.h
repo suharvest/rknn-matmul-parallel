@@ -105,6 +105,12 @@ typedef struct {
      * Useful when INT4 NPU lm_head causes unacceptable precision loss.
      * 0 = auto (use NPU if available), 1 = force CPU lm_head */
     int disable_npu_lm_head;
+
+    /* Max M for batch prefill. 0 = auto (64).
+     * Controls the maximum number of tokens processed in a single
+     * matmul_decoder_prefill_batch() call. Larger values use more memory
+     * but process longer sequences without chunking. */
+    int max_batch_prefill;
 } MatmulDecoderConfig;
 
 /**
@@ -133,6 +139,7 @@ static inline MatmulDecoderConfig matmul_decoder_config_qwen3_0_6b(void) {
         .lm_head_vocab_size = 0,
         .iommu_domain_id = 1,  /* Separate from RKNN models on domain 0 */
         .exec_mode = EXEC_DUAL_CORE,  /* Use dual NPU core by default */
+        .max_batch_prefill = 64,
     };
 }
 
@@ -172,6 +179,7 @@ static inline MatmulDecoderConfig matmul_decoder_config_qwen3_tts_cp(void) {
         .lm_head_vocab_size = 2048,
         .iommu_domain_id = 1,
         .exec_mode = EXEC_DUAL_CORE,
+        .max_batch_prefill = 64,
     };
 }
 
@@ -329,6 +337,19 @@ int matmul_decoder_step_head(MatmulDecoderContext* ctx,
                              const float* embedding,
                              int lm_head_idx,
                              float* output_logits);
+
+/**
+ * Batch prefill: process M embeddings in one pass through all layers.
+ * Fills KV cache, skips lm_head. Much faster than M sequential prefill() calls
+ * because matmul projections are batched (M rows at once on NPU).
+ *
+ * @param ctx        Decoder context
+ * @param embeddings [M * hidden_dim] contiguous float32 embeddings
+ * @param M          Number of tokens (must be <= max_seq_len - current_seq_len)
+ * @return           0 on success, negative error code on failure
+ */
+int matmul_decoder_prefill_batch(MatmulDecoderContext* ctx,
+                                  const float* embeddings, int M);
 
 /**
  * Clear KV cache for new sequence.

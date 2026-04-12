@@ -150,6 +150,25 @@ struct MatmulDecoderContext {
     ExecutionMode exec_mode;
     int n_workers;              /* 1 for single-core, 2 for dual-core */
 
+    /* Batch prefill resources (lazy-allocated on first prefill_batch call) */
+    float* batch_hidden;        /* [max_m * hidden_dim] */
+    float* batch_residual;      /* [max_m * hidden_dim] */
+    float* batch_normed;        /* [max_m * hidden_dim] */
+    float* batch_q_out;         /* [max_m * num_q_heads * head_dim] */
+    float* batch_k_out;         /* [max_m * num_kv_heads * head_dim] */
+    float* batch_v_out;         /* [max_m * num_kv_heads * head_dim] */
+    float* batch_attn_out;      /* [max_m * num_q_heads * head_dim] */
+    float* batch_ffn_gate;      /* [max_m * ffn_dim] */
+    float* batch_ffn_up;        /* [max_m * ffn_dim] */
+    float* batch_ffn_down;      /* [max_m * hidden_dim] */
+    int batch_max_m;            /* Allocated batch size */
+    int batch_buffers_allocated;/* 1 if batch buffers are allocated */
+
+    /* Batch pool contexts (M=max_batch, share B from M=1 pool) */
+    MatmulPoolEntry batch_pool[MAX_MATMUL_POOL];
+    int n_batch_pool;
+    int batch_pool_map[MAX_MATMUL_POOL]; /* batch_pool[i] corresponds to pool[batch_pool_map[i]] */
+
     /* Stats */
     MatmulDecoderStats stats;
 };
@@ -1526,6 +1545,21 @@ int matmul_decoder_step(MatmulDecoderContext* ctx,
         _cpu_ops_ms += now_ms() - _cpu_t0;
     }
 
+    /* Prefill mode: if output_logits is NULL, skip final_norm + lm_head.
+     * This saves ~35ms (lm_head) + ~1ms (final_norm) per token during prefill,
+     * where we only need to fill the KV cache, not produce logits. */
+    if (!output_logits) {
+        ctx->kv_cache->seq_len++;
+        ctx->stats.total_ms = (float)(now_ms() - _step_t0);
+        ctx->stats.matmul_ms = (float)_acc_matmul_ms;
+        ctx->stats.rebind_ms = (float)_acc_rebind_ms;
+        ctx->stats.convert_ms = (float)_acc_convert_ms;
+        ctx->stats.cpu_ops_ms = (float)_cpu_ops_ms;
+        ctx->stats.lm_head_ms = 0;
+        ctx->stats.n_steps++;
+        return 0;  /* No token sampled in prefill mode */
+    }
+
     /* Final norm (CPU) */
     _cpu_t0 = now_ms();
     rms_norm_f32(ctx->normed, ctx->hidden,
@@ -1707,6 +1741,329 @@ int matmul_decoder_step_head(MatmulDecoderContext* ctx,
     return argmax_f32(ctx->logits, lm_vocab);
 }
 
+/* ─── Batch Prefill ─── */
+
+/**
+ * Find batch pool entry for a given (K, N).
+ * Returns batch pool index, or -1 if not found.
+ */
+static int batch_pool_find(MatmulDecoderContext* ctx, int K, int N) {
+    for (int i = 0; i < ctx->n_batch_pool; i++) {
+        if (ctx->batch_pool[i].K == K && ctx->batch_pool[i].N == N)
+            return i;
+    }
+    return -1;
+}
+
+/**
+ * Create batch pool entries corresponding to existing M=1 pool entries.
+ * Each batch pool entry has M=max_batch, and shares the same (K,N) dims.
+ */
+static int init_batch_pool(MatmulDecoderContext* ctx, int max_m) {
+    ctx->n_batch_pool = 0;
+
+    for (int i = 0; i < ctx->n_pool; i++) {
+        MatmulPoolEntry* pe1 = &ctx->pool[i];
+        if (!pe1->initialized) continue;
+
+        /* Skip if already have a batch pool entry for this (K,N) */
+        if (batch_pool_find(ctx, pe1->K, pe1->N) >= 0) continue;
+
+        if (ctx->n_batch_pool >= MAX_MATMUL_POOL) {
+            fprintf(stderr, "[BatchPrefill] Exceeded max batch pool size %d\n", MAX_MATMUL_POOL);
+            return -1;
+        }
+
+        int idx = ctx->n_batch_pool++;
+        MatmulPoolEntry* bpe = &ctx->batch_pool[idx];
+        memset(bpe, 0, sizeof(*bpe));
+
+        rknn_matmul_info info;
+        memset(&info, 0, sizeof(info));
+        info.M = max_m;
+        info.K = pe1->K;
+        info.N = pe1->N;
+        info.type = pe1->info.type;
+        info.B_layout = 1;
+        info.iommu_domain_id = pe1->info.iommu_domain_id;
+
+        bpe->info = info;
+
+        int ret = rknn_matmul_create(&bpe->ctx, &info, &bpe->io);
+        if (ret != 0) {
+            fprintf(stderr, "[BatchPrefill] rknn_matmul_create(M=%d,K=%d,N=%d) failed: %d\n",
+                    max_m, pe1->K, pe1->N, ret);
+            ctx->n_batch_pool--;
+            return -1;
+        }
+
+        bpe->mem_A = rknn_create_mem(bpe->ctx, bpe->io.A.size);
+        bpe->mem_C = rknn_create_mem(bpe->ctx, bpe->io.C.size);
+        if (!bpe->mem_A || !bpe->mem_C) {
+            fprintf(stderr, "[BatchPrefill] rknn_create_mem failed for batch pool(%d,%d)\n",
+                    pe1->K, pe1->N);
+            rknn_matmul_destroy(bpe->ctx);
+            ctx->n_batch_pool--;
+            return -1;
+        }
+
+        rknn_matmul_set_io_mem(bpe->ctx, bpe->mem_A, &bpe->io.A);
+        rknn_matmul_set_io_mem(bpe->ctx, bpe->mem_C, &bpe->io.C);
+
+        bpe->K = pe1->K;
+        bpe->N = pe1->N;
+        bpe->initialized = 1;
+
+        ctx->batch_pool_map[idx] = i;
+
+        printf("[BatchPrefill] Created batch_pool[%d]: M=%d K=%d N=%d\n",
+               idx, max_m, pe1->K, pe1->N);
+    }
+
+    return 0;
+}
+
+/**
+ * Run batch matmul: M rows input through a projection.
+ *
+ * Uses the batch pool entry (has ctx/A/C for M=max_batch),
+ * rebinds B from the M=1 PersistentMatmul's weight buffer.
+ *
+ * @param pm        M=1 projection (has mem_B with weights, col_scales)
+ * @param bpe       Batch pool entry (has ctx, mem_A, mem_C for M=max)
+ * @param input     Input [M * K] FP32
+ * @param output    Output [M * N] FP32
+ * @param M         Actual batch size (<= max_batch)
+ * @param K         Input dimension
+ * @param N         Output dimension
+ * @return          0 on success
+ */
+static int run_batch_matmul(PersistentMatmul* pm, MatmulPoolEntry* bpe,
+                             const float* input, float* output,
+                             int M, int K, int N) {
+    /* Convert M*K floats to FP16, write to batch A buffer */
+    vec_fp32_to_fp16((int16_t*)bpe->mem_A->virt_addr, input, M * K);
+
+    /* Rebind B from M=1 context's weight buffer */
+    rknn_matmul_set_io_mem(bpe->ctx, pm->mem_B, &bpe->io.B);
+
+    /* Run batch matmul */
+    int ret = rknn_matmul_run(bpe->ctx);
+    if (ret != 0) {
+        fprintf(stderr, "[BatchPrefill] rknn_matmul_run failed: %d\n", ret);
+        return MATMUL_DECODER_ERR_RKNN;
+    }
+
+    /* Read M*N output and apply per-column scales if needed */
+    if (pm->output_is_fp32 && pm->col_scales) {
+        /* FP32 output + per-column scales */
+        const float* src = (const float*)bpe->mem_C->virt_addr;
+        const float* scales = pm->col_scales;
+        for (int t = 0; t < M; t++) {
+            int row_off = t * N;
+            int i;
+            for (i = 0; i <= N - 4; i += 4) {
+                float32x4_t f = vld1q_f32(src + row_off + i);
+                float32x4_t s = vld1q_f32(scales + i);
+                vst1q_f32(output + row_off + i, vmulq_f32(f, s));
+            }
+            for (; i < N; i++) {
+                output[row_off + i] = src[row_off + i] * scales[i];
+            }
+        }
+    } else if (pm->output_is_fp32) {
+        memcpy(output, bpe->mem_C->virt_addr, M * N * sizeof(float));
+    } else if (pm->col_scales) {
+        /* FP16 output + per-column scales */
+        const int16_t* src = (const int16_t*)bpe->mem_C->virt_addr;
+        const float* scales = pm->col_scales;
+        for (int t = 0; t < M; t++) {
+            int row_off = t * N;
+            int i;
+            for (i = 0; i <= N - 4; i += 4) {
+                float16x4_t h = vld1_f16((const __fp16*)(src + row_off + i));
+                float32x4_t f = vcvt_f32_f16(h);
+                float32x4_t s = vld1q_f32(scales + i);
+                vst1q_f32(output + row_off + i, vmulq_f32(f, s));
+            }
+            for (; i < N; i++) {
+                output[row_off + i] = (float)(*(const __fp16*)(src + row_off + i)) * scales[i];
+            }
+        }
+    } else {
+        /* FP16 output, no scales */
+        vec_fp16_to_fp32(output, (int16_t*)bpe->mem_C->virt_addr, M * N);
+    }
+
+    return MATMUL_DECODER_OK;
+}
+
+int matmul_decoder_prefill_batch(MatmulDecoderContext* ctx,
+                                  const float* embeddings, int M) {
+    if (!ctx || !embeddings || M <= 0)
+        return MATMUL_DECODER_ERR_INVALID_ARG;
+
+    int hidden_dim = ctx->config.hidden_dim;
+    int num_layers = ctx->config.num_layers;
+    int num_q_heads = ctx->config.num_q_heads;
+    int num_kv_heads = ctx->config.num_kv_heads;
+    int head_dim = ctx->config.head_dim;
+    int ffn_dim = ctx->config.ffn_dim;
+    int q_dim = num_q_heads * head_dim;
+    int kv_dim = num_kv_heads * head_dim;
+    int seq_len = ctx->kv_cache->seq_len;
+
+    if (seq_len + M > ctx->kv_cache->max_seq_len) {
+        fprintf(stderr, "[BatchPrefill] KV cache overflow: seq_len=%d + M=%d > max=%d\n",
+                seq_len, M, ctx->kv_cache->max_seq_len);
+        return MATMUL_DECODER_ERR_INVALID_ARG;
+    }
+
+    int max_m = ctx->config.max_batch_prefill > 0 ? ctx->config.max_batch_prefill : 64;
+    if (M > max_m) {
+        /* Process in chunks of max_m */
+        for (int offset = 0; offset < M; offset += max_m) {
+            int chunk = M - offset;
+            if (chunk > max_m) chunk = max_m;
+            int ret = matmul_decoder_prefill_batch(ctx, embeddings + offset * hidden_dim, chunk);
+            if (ret != 0) return ret;
+        }
+        return MATMUL_DECODER_OK;
+    }
+
+    /* Lazy-allocate batch buffers on first call */
+    if (!ctx->batch_buffers_allocated) {
+        ctx->batch_max_m = max_m;
+        ctx->batch_hidden    = aligned_alloc(64, (size_t)max_m * hidden_dim * sizeof(float));
+        ctx->batch_residual  = aligned_alloc(64, (size_t)max_m * hidden_dim * sizeof(float));
+        ctx->batch_normed    = aligned_alloc(64, (size_t)max_m * hidden_dim * sizeof(float));
+        ctx->batch_q_out     = aligned_alloc(64, (size_t)max_m * q_dim * sizeof(float));
+        ctx->batch_k_out     = aligned_alloc(64, (size_t)max_m * kv_dim * sizeof(float));
+        ctx->batch_v_out     = aligned_alloc(64, (size_t)max_m * kv_dim * sizeof(float));
+        ctx->batch_attn_out  = aligned_alloc(64, (size_t)max_m * q_dim * sizeof(float));
+        ctx->batch_ffn_gate  = aligned_alloc(64, (size_t)max_m * ffn_dim * sizeof(float));
+        ctx->batch_ffn_up    = aligned_alloc(64, (size_t)max_m * ffn_dim * sizeof(float));
+        ctx->batch_ffn_down  = aligned_alloc(64, (size_t)max_m * hidden_dim * sizeof(float));
+
+        if (!ctx->batch_hidden || !ctx->batch_residual || !ctx->batch_normed ||
+            !ctx->batch_q_out || !ctx->batch_k_out || !ctx->batch_v_out ||
+            !ctx->batch_attn_out || !ctx->batch_ffn_gate || !ctx->batch_ffn_up ||
+            !ctx->batch_ffn_down) {
+            fprintf(stderr, "[BatchPrefill] Failed to allocate batch buffers\n");
+            return MATMUL_DECODER_ERR_MEMORY;
+        }
+
+        /* Create batch pool contexts */
+        if (init_batch_pool(ctx, max_m) != 0) {
+            fprintf(stderr, "[BatchPrefill] Failed to create batch pool\n");
+            return MATMUL_DECODER_ERR_RKNN;
+        }
+
+        ctx->batch_buffers_allocated = 1;
+        printf("[BatchPrefill] Allocated batch buffers: max_m=%d, %d batch pool entries\n",
+               max_m, ctx->n_batch_pool);
+    }
+
+    /* Copy embeddings into batch_hidden */
+    memcpy(ctx->batch_hidden, embeddings, (size_t)M * hidden_dim * sizeof(float));
+
+    for (int layer = 0; layer < num_layers; layer++) {
+        LayerMatmulContext* lc = &ctx->layers[layer];
+        float* layer_k_cache = ctx->kv_cache->k_cache +
+            (size_t)layer * ctx->kv_cache->max_seq_len * kv_dim;
+        float* layer_v_cache = ctx->kv_cache->v_cache +
+            (size_t)layer * ctx->kv_cache->max_seq_len * kv_dim;
+
+        /* 1. Save residual + RMSNorm (batch) */
+        memcpy(ctx->batch_residual, ctx->batch_hidden, (size_t)M * hidden_dim * sizeof(float));
+        rms_norm_batch_f32(ctx->batch_normed, ctx->batch_hidden,
+                           lc->input_norm_w, M, hidden_dim, ctx->config.rms_eps);
+
+        /* 2. Q/K/V projections (batch matmul) */
+        MatmulPoolEntry* bpe_q = &ctx->batch_pool[batch_pool_find(ctx, lc->q_proj.K, lc->q_proj.N)];
+        MatmulPoolEntry* bpe_k = &ctx->batch_pool[batch_pool_find(ctx, lc->k_proj.K, lc->k_proj.N)];
+        MatmulPoolEntry* bpe_v = &ctx->batch_pool[batch_pool_find(ctx, lc->v_proj.K, lc->v_proj.N)];
+
+        run_batch_matmul(&lc->q_proj, bpe_q, ctx->batch_normed, ctx->batch_q_out,
+                         M, hidden_dim, q_dim);
+        run_batch_matmul(&lc->k_proj, bpe_k, ctx->batch_normed, ctx->batch_k_out,
+                         M, hidden_dim, kv_dim);
+        run_batch_matmul(&lc->v_proj, bpe_v, ctx->batch_normed, ctx->batch_v_out,
+                         M, hidden_dim, kv_dim);
+
+        /* 3. QK norm (per-head, batch) */
+        if (ctx->config.has_qk_norm && lc->q_norm_w && lc->k_norm_w) {
+            for (int t = 0; t < M; t++) {
+                for (int h = 0; h < num_q_heads; h++) {
+                    float* q_head = ctx->batch_q_out + t * q_dim + h * head_dim;
+                    rms_norm_f32(q_head, q_head, lc->q_norm_w, head_dim, ctx->config.rms_eps);
+                }
+                for (int h = 0; h < num_kv_heads; h++) {
+                    float* k_head = ctx->batch_k_out + t * kv_dim + h * head_dim;
+                    rms_norm_f32(k_head, k_head, lc->k_norm_w, head_dim, ctx->config.rms_eps);
+                }
+            }
+        }
+
+        /* 4. RoPE (batch, positions seq_len..seq_len+M-1) */
+        apply_rope_batch_f32(ctx->batch_q_out, M, seq_len,
+                             num_q_heads, head_dim, ctx->config.rope_theta,
+                             ctx->config.rope_style);
+        apply_rope_batch_f32(ctx->batch_k_out, M, seq_len,
+                             num_kv_heads, head_dim, ctx->config.rope_theta,
+                             ctx->config.rope_style);
+
+        /* 5-6. Causal attention (batch) — uses cache[0..seq_len) + batch K/V.
+         * Cache write happens AFTER attention to avoid double-counting batch tokens. */
+        attention_batch_causal_f32(ctx->batch_attn_out,
+                                   ctx->batch_q_out,
+                                   ctx->batch_k_out,
+                                   ctx->batch_v_out,
+                                   layer_k_cache, layer_v_cache,
+                                   M, num_q_heads, num_kv_heads, head_dim,
+                                   seq_len);
+
+        /* Store K,V to cache at positions [seq_len, seq_len+M) (after attention) */
+        for (int t = 0; t < M; t++) {
+            memcpy(layer_k_cache + (seq_len + t) * kv_dim,
+                   ctx->batch_k_out + t * kv_dim,
+                   kv_dim * sizeof(float));
+            memcpy(layer_v_cache + (seq_len + t) * kv_dim,
+                   ctx->batch_v_out + t * kv_dim,
+                   kv_dim * sizeof(float));
+        }
+
+        /* 7. O projection (batch) + residual */
+        MatmulPoolEntry* bpe_o = &ctx->batch_pool[batch_pool_find(ctx, lc->o_proj.K, lc->o_proj.N)];
+        run_batch_matmul(&lc->o_proj, bpe_o, ctx->batch_attn_out, ctx->batch_hidden,
+                         M, q_dim, hidden_dim);
+        vec_add_batch_f32(ctx->batch_hidden, ctx->batch_residual, M, hidden_dim);
+
+        /* 8. Post-attention norm + FFN */
+        rms_norm_batch_f32(ctx->batch_normed, ctx->batch_hidden,
+                           lc->post_attn_norm_w, M, hidden_dim, ctx->config.rms_eps);
+
+        MatmulPoolEntry* bpe_gate = &ctx->batch_pool[batch_pool_find(ctx, lc->gate_proj.K, lc->gate_proj.N)];
+        MatmulPoolEntry* bpe_up   = &ctx->batch_pool[batch_pool_find(ctx, lc->up_proj.K, lc->up_proj.N)];
+        run_batch_matmul(&lc->gate_proj, bpe_gate, ctx->batch_normed, ctx->batch_ffn_gate,
+                         M, hidden_dim, ffn_dim);
+        run_batch_matmul(&lc->up_proj, bpe_up, ctx->batch_normed, ctx->batch_ffn_up,
+                         M, hidden_dim, ffn_dim);
+
+        silu_mul_batch_f32(ctx->batch_ffn_gate, ctx->batch_ffn_gate, ctx->batch_ffn_up, M, ffn_dim);
+
+        MatmulPoolEntry* bpe_down = &ctx->batch_pool[batch_pool_find(ctx, lc->down_proj.K, lc->down_proj.N)];
+        run_batch_matmul(&lc->down_proj, bpe_down, ctx->batch_ffn_gate, ctx->batch_ffn_down,
+                         M, ffn_dim, hidden_dim);
+
+        /* Residual: hidden += ffn_down */
+        vec_add_batch_f32(ctx->batch_hidden, ctx->batch_ffn_down, M, hidden_dim);
+    }
+
+    ctx->kv_cache->seq_len += M;
+    return MATMUL_DECODER_OK;
+}
+
 void matmul_decoder_clear_kv_cache(MatmulDecoderContext* ctx) {
     if (ctx && ctx->kv_cache) {
         matmul_kv_cache_clear(ctx->kv_cache);
@@ -1753,6 +2110,10 @@ void matmul_decoder_destroy(MatmulDecoderContext* ctx) {
         ctx->layers = NULL;
     }
 
+    /* Destroy batch pool contexts first (independent from M=1 pool) */
+    destroy_pool(ctx->batch_pool, ctx->n_batch_pool);
+    ctx->n_batch_pool = 0;
+
     /* Destroy pool contexts — rknn_matmul_destroy frees all DMA mem
      * allocated from that ctx (including per-layer B buffers). */
     destroy_pool(ctx->pool, ctx->n_pool);
@@ -1777,6 +2138,18 @@ void matmul_decoder_destroy(MatmulDecoderContext* ctx) {
         free(ctx->lm_npu_scales);
     }
     free(ctx->lm_npu_B);  /* DMA mem freed by pool destroy */
+
+    /* Free batch prefill buffers */
+    free(ctx->batch_hidden);
+    free(ctx->batch_residual);
+    free(ctx->batch_normed);
+    free(ctx->batch_q_out);
+    free(ctx->batch_k_out);
+    free(ctx->batch_v_out);
+    free(ctx->batch_attn_out);
+    free(ctx->batch_ffn_gate);
+    free(ctx->batch_ffn_up);
+    free(ctx->batch_ffn_down);
 
     /* final_norm_w: only free if it's NOT a borrowed pointer from last layer */
     if (ctx->final_norm_w && ctx->layers &&

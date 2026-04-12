@@ -173,6 +173,88 @@ void vec_fp32_to_fp16(int16_t* dst, const float* src, int n);
  */
 void vec_fp16_to_fp32(float* dst, const int16_t* src, int n);
 
+/* ─── Batch Operations (for batch prefill) ─── */
+
+/**
+ * Batch RMSNorm: process M vectors.
+ * Calls rms_norm_f32() for each of M rows.
+ *
+ * @param out     Output buffer [M * dim]
+ * @param x       Input buffer [M * dim]
+ * @param weight  Normalization weight [dim]
+ * @param M       Number of vectors
+ * @param dim     Dimension per vector
+ * @param eps     Epsilon (typically 1e-6)
+ */
+void rms_norm_batch_f32(float* out, const float* x, const float* weight,
+                         int M, int dim, float eps);
+
+/**
+ * Batch RoPE: each token t gets position start_pos + t.
+ *
+ * @param x          [M * num_heads * head_dim] — modified in-place
+ * @param M          Number of tokens
+ * @param start_pos  Position of first token in sequence
+ * @param num_heads  Number of attention heads
+ * @param head_dim   Dimension per head
+ * @param rope_theta RoPE base frequency
+ * @param rope_style 0=interleaved (Qwen3/LLaMA), 1=split-half (GPT-NeoX)
+ */
+void apply_rope_batch_f32(float* x, int M, int start_pos,
+                           int num_heads, int head_dim, float rope_theta, int rope_style);
+
+/**
+ * Batch SiLU * element-wise multiply.
+ * out[t] = silu(gate[t]) * up[t] for t in [0, M).
+ *
+ * @param out   Output buffer [M * dim]
+ * @param gate  Gate input [M * dim]
+ * @param up    Up input [M * dim]
+ * @param M     Number of vectors
+ * @param dim   Dimension per vector
+ */
+void silu_mul_batch_f32(float* out, const float* gate, const float* up, int M, int dim);
+
+/**
+ * Batch vector add: dst[t] += src[t] for t in [0, M).
+ *
+ * @param dst   Destination buffer [M * dim] — modified in-place
+ * @param src   Source buffer [M * dim]
+ * @param M     Number of vectors
+ * @param dim   Dimension per vector
+ */
+void vec_add_batch_f32(float* dst, const float* src, int M, int dim);
+
+/**
+ * Batch causal attention for prefill.
+ * For each token t in [0,M), computes attention over the combined
+ * KV cache (cache_seq_len entries) + batch tokens [0..t] (causal mask).
+ *
+ * KV cache layout: [seq_len, num_kv_heads, head_dim] (interleaved per position).
+ * Batch Q/K/V layout: [M, num_heads, head_dim] contiguous.
+ *
+ * @param out            Output [M * num_q_heads * head_dim]
+ * @param q_batch        Query batch [M * num_q_heads * head_dim]
+ * @param k_batch        Key batch [M * num_kv_heads * head_dim]
+ * @param v_batch        Value batch [M * num_kv_heads * head_dim]
+ * @param k_cache        Key cache [max_seq * num_kv_heads * head_dim]
+ * @param v_cache        Value cache [max_seq * num_kv_heads * head_dim]
+ * @param M              Number of tokens in batch
+ * @param num_q_heads    Number of query heads
+ * @param num_kv_heads   Number of KV heads (GQA support)
+ * @param head_dim       Dimension per head
+ * @param cache_seq_len  Entries already in KV cache before this batch
+ */
+void attention_batch_causal_f32(
+    float* out,
+    const float* q_batch,
+    const float* k_batch,
+    const float* v_batch,
+    const float* k_cache,
+    const float* v_cache,
+    int M, int num_q_heads, int num_kv_heads, int head_dim,
+    int cache_seq_len);
+
 /* ─── Sampling ─── */
 
 /**

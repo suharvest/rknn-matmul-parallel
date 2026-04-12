@@ -112,7 +112,6 @@ public:
 
         float* emb_ptr = nullptr;
         py::array_t<float> emb_arr;
-        std::vector<float> emb_vec;
 
         if (!embedding.is_none()) {
             emb_arr = embedding.cast<py::array_t<float>>();
@@ -125,9 +124,50 @@ public:
         auto logits_buf = logits.request();
         float* logits_ptr = static_cast<float*>(logits_buf.ptr);
 
-        int result = matmul_decoder_step(ctx_, token_id, emb_ptr, logits_ptr);
+        matmul_decoder_step(ctx_, token_id, emb_ptr, logits_ptr);
 
         return logits;
+    }
+
+    void prefill_batch(py::array_t<float> embeddings) {
+        if (!ctx_) {
+            throw std::runtime_error("Decoder not initialized");
+        }
+
+        auto buf = embeddings.request();
+        if (buf.ndim != 2) {
+            throw std::runtime_error("prefill_batch: embeddings must be 2D [M, hidden_dim]");
+        }
+        int M = buf.shape[0];
+        int ret = matmul_decoder_prefill_batch(ctx_, static_cast<float*>(buf.ptr), M);
+        if (ret != 0) {
+            throw std::runtime_error("prefill_batch failed with error code " + std::to_string(ret));
+        }
+    }
+
+    void prefill(int token_id, py::object embedding = py::none()) {
+        if (!ctx_) {
+            throw std::runtime_error("Decoder not initialized");
+        }
+
+        float* emb_ptr = nullptr;
+        py::array_t<float> emb_arr;
+
+        if (!embedding.is_none()) {
+            emb_arr = embedding.cast<py::array_t<float>>();
+            auto buf = emb_arr.request();
+
+            // Auto-detect 2D input: route to batch prefill
+            if (buf.ndim == 2) {
+                prefill_batch(emb_arr);
+                return;
+            }
+
+            emb_ptr = static_cast<float*>(buf.ptr);
+        }
+
+        // Pass NULL for output_logits → skips final_norm + lm_head
+        matmul_decoder_step(ctx_, token_id, emb_ptr, nullptr);
     }
 
     int step_get_token(int token_id, py::object embedding = py::none()) {
@@ -144,7 +184,10 @@ public:
             emb_ptr = static_cast<float*>(buf.ptr);
         }
 
-        int token = matmul_decoder_step(ctx_, token_id, emb_ptr, nullptr);
+        // Must pass non-NULL logits buffer so C code runs lm_head + argmax.
+        // NULL logits triggers prefill-only mode (skips lm_head, returns 0).
+        std::vector<float> logits(config_.vocab_size);
+        int token = matmul_decoder_step(ctx_, token_id, emb_ptr, logits.data());
         return token;
     }
 
@@ -263,6 +306,16 @@ PYBIND11_MODULE(matmul_decoder, m) {
              py::arg("token_id"),
              py::arg("embedding") = py::none(),
              "Run one decoding step, return logits")
+
+        .def("prefill", &PyMatmulDecoder::prefill,
+             py::arg("token_id"),
+             py::arg("embedding") = py::none(),
+             "Run one prefill step (fills KV cache, skips lm_head). "
+             "If embedding is 2D [M, hidden_dim], routes to batch prefill.")
+
+        .def("prefill_batch", &PyMatmulDecoder::prefill_batch,
+             py::arg("embeddings"),
+             "Batch prefill M tokens. embeddings must be 2D [M, hidden_dim].")
 
         .def("step_get_token", &PyMatmulDecoder::step_get_token,
              py::arg("token_id"),
